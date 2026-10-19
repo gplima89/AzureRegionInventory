@@ -18,7 +18,7 @@ not require Azure CLI, Excel, the ImportExcel module, or Python.
 ## One-file quick start
 
 Download or copy **only [Export-AzureRegionalInventory.ps1](./Export-AzureRegionalInventory.ps1)**.
-The collector now includes all query, preflight, normalization, dependency and
+The collector now includes all query, preflight, normalization and
 Excel-export functions in this one file. No project-specific `.psm1` module,
 companion script, repository clone or test runner is needed.
 
@@ -38,7 +38,7 @@ Get-Help .\Export-AzureRegionalInventory.ps1 -Full
 ```
 
 The script is organized into collapsible regions for Azure queries, service/
-dependency helpers, streaming Excel export, and preflight/orchestration.
+inventory helpers, streaming Excel export, and preflight/orchestration.
 Start reading `Invoke-RegionalInventory` for the end-to-end flow; the final line
 calls it with the command-line parameters.
 
@@ -135,8 +135,12 @@ authorization/query failures still stop preflight or mark collection `Partial`.
 
 ## Run
 
-Run the self-contained `Export-AzureRegionalInventory.ps1` file. Its command-line
-parameters are unchanged from the earlier multi-file version.
+Run the self-contained `Export-AzureRegionalInventory.ps1` file. Collection is
+now regional-only, with global/regionless and known secondary-region context.
+Dependency analysis has been removed, including the `DependencyScope` parameter,
+dependency JSONL files and the `Dependencies`/`DependencyImpact` worksheets.
+Remove `-DependencyScope` from older commands. No all-regions resource scan is
+performed; tenant-wide **subscription scope** and pagination remain unchanged.
 
 ```powershell
 # Example only: select the actual source and destination for your migration.
@@ -154,12 +158,6 @@ parameters are unchanged from the earlier multi-file version.
     -TenantId '<tenant-guid>' `
     -SubscriptionId @('<subscription-guid-1>', '<subscription-guid-2>') `
     -OutputDirectory '.\SEA-scoped'
-
-# Optional: faster, narrower discovery, at the cost of inbound-dependency visibility.
-.\Export-AzureRegionalInventory.ps1 `
-    -SourceRegion southeastasia `
-    -DependencyScope SourceRegionOnly `
-    -OutputDirectory '.\SEA-regional-only'
 
 # See canonical region names (not display names such as "Southeast Asia").
 Get-AzLocation | Select-Object Location, DisplayName
@@ -200,13 +198,13 @@ All queries now execute in-process using `Search-AzGraph`; no `az` subprocess is
 Tenant scope is limited to the selected tenant and resources visible to the
 signed-in identity, not every tenant in the session. The script does not enable
 `-AllowPartialScope`: service scope-limit errors must be resolved explicitly.
-If needed, pass smaller subscription arrays and document the combined coverage;
-dependency resolution cannot cross separate runs.
+If needed, pass smaller subscription arrays and document the combined coverage.
+App Service plan SKU and parent-region lookups cannot cross separate runs.
 
 Continuation tokens are safer than repeatedly issuing `-First 1000` alone,
 which would return the first page again. There are no `take`, `limit`, or
-`mv-expand` operators in the resource paging query. Dependency extraction happens
-locally, avoiding expansion limits and join-related fan-out in ARG.
+`mv-expand` operators in the resource paging query. No dependency graph is
+constructed, and there are no dependency-related joins or expansion queries.
 
 The core paging follows this pattern, with duplicate/token/count checks around it:
 
@@ -233,11 +231,10 @@ the index/JSONL stream, avoiding repeated copying of a growing array. An empty
 scope with no matching resources is a valid audited result: the script still
 produces a workbook instead of calling `exit`.
 
-Preflight runs one live ARG resource-count request for the entire selected scope.
-For `AllAccessibleRegions`, collection reuses that initial count rather than
-issuing it again; the final reconciliation count is still queried.
-`SourceRegionOnly` has a different filter and therefore needs its own initial
-count. Transient throttling, timeout and selected server failures receive bounded
+Preflight runs one live ARG resource-count request using the regional filter
+across the selected tenant or subscription array. Collection reuses that initial
+count with the same filter; the final reconciliation count is still queried.
+Transient throttling, timeout and selected server failures receive bounded
 exponential backoff with jitter (six retries by default). Authorization errors
 fail that dataset rather than being retried indefinitely. Resource-group and
 resource collection are independent: a failed group query is recorded, but does
@@ -264,14 +261,21 @@ latency, throttling and metadata/export size still affect elapsed time.
   eliminating repeated count/page loops and context changes per subscription.
 - If already signed in, omit `-Login` to avoid another interactive sign-in.
 - Use `-Verbose` to see each ARG call's elapsed time. Page progress is always
-  printed, including per-page and cumulative resource counts. Stage
-  messages distinguish collection, reference resolution and workbook export.
+  printed, including dataset names (`ResourceGroups` versus `Resources`),
+  per-page and cumulative row counts. Stage messages distinguish collection,
+  inventory/SKU finalization and workbook export.
+- Excel export always prints dataset position/name, worksheet start/completion,
+  and row activity every 1,000 data rows or after five seconds of row processing,
+  whichever comes first. Updates include cumulative data rows and elapsed
+  export time; headers are not counted. Finalization and ZIP archive closing
+  are separate messages. These are activity checkpoints, not a background
+  heartbeat or an estimated percentage; a blocked I/O operation can delay them.
 - Modules load once per process, contexts are reused for every page, and
   preflight counts are reused when the query filter matches. Excel column labels
   are cached once per dataset. Completeness checks are not disabled for speed.
-- `-DependencyScope SourceRegionOnly` reduces collected metadata, but sacrifices
-  inbound dependency visibility from other regions; use only when that trade-off
-  is acceptable. The default preserves cross-region discovery.
+- Resource queries always filter by source region plus global/regionless and
+  known secondary-region context before paging. Unrelated-region resources are
+  not downloaded for dependency analysis.
 
 ```powershell
 # Reuse your existing Connect-AzAccount session and test one subscription.
@@ -287,8 +291,6 @@ latency, throttling and metadata/export size still affect elapsed time.
 |---|---|
 | Summary | Snapshot counts by subscription, resource type and impact scope; counts with no tags and no exposed/applicable SKU; formula totals. |
 | Inventory | Impacted resource IDs/names/types, groups, subscriptions and tenants, declared/effective regions, normalized SKU, zones, state, identity metadata, tags, selected service details and migration review prompts. |
-| Dependencies | Configured outbound and inbound ARM references touching an impacted resource; cross-region/subscription flags, evidence paths and resolution status. |
-| DependencyImpact | Per-impacted-resource inbound/outbound reference counts, cross-region references and unresolved references. Counts are evidence rows, not distinct applications or traffic flows. |
 | GlobalContext | Global or unspecified-location resources for a separate review; not automatically counted as impacted. |
 | ResourceGroups | Group metadata location and tags. Group location is not workload deployment location. |
 | ScopeAudit | One row per dataset for the aggregate tenant or subscription-array scope, including tenant/explicit IDs, expected/downloaded counts, page counts and reconciliation status. |
@@ -335,35 +337,27 @@ means no tags at all, not missing specific organizational mandatory tags.
 Tags remain JSON so arbitrary tag names do not create thousands of Excel columns.
 Resource-group tags are not silently treated as inherited resource tags.
 
-### Dependency interpretation
+### Regional collection and analysis limits
 
-By default, `AllAccessibleRegions` indexes **all regions of the selected
-subscriptions**, not just the source. This is intentional: otherwise an app or
-network resource in another region pointing into the source would be missed.
-Only relationships touching impacted resources are exported.
+The Resources query selects exact, case-insensitive source-region placement,
+global/blank locations, and known storage/Cosmos secondary-region fields.
+It does not scan unrelated regional resources. Resource groups are a separate
+metadata dataset across the entire selected tenant or subscription array;
+their locations do not establish workload placement.
 
-The collector scans configuration and identity objects for exact ARM resource-ID
-values and user-assigned identity ID keys. It also adds ARM parent relationships
-and AKS node-resource-group membership as explicitly labeled structural
-inferences. It resolves references after all pages in the selected scope have been scanned.
-Subnets and other unindexed child IDs can resolve to their nearest indexed
-ancestor; the exact referenced ID is preserved alongside that ancestor.
+After paging, App Service plan SKUs and inherited parent regions are finalized
+against the regional resource index. Plans/parents outside that index cannot
+be resolved; unknown SKU values remain explicit rather than being invented.
+Global/regionless resources without an impacted parent stay in `GlobalContext`.
+The downloaded count therefore need not equal the Inventory row count or an
+exact-region-only ARG count.
 
-Examples include VM/NIC/disk/VNet references, app/plan links, managed identities,
-private endpoints, peering and configured linked service IDs where ARG exposes
-them. A configuration reference does not prove runtime traffic, dependency
-criticality, or a valid migration sequence.
-
-This is a **one-hop metadata analysis**, not a transitive application dependency
-graph. Unresolved IDs may be outside scope, invisible under RBAC, unsupported by
-ARG, deleted, or a reference to an unindexed subresource. They are not automatically
-broken references. Cross-region status remains unspecified for resources with
-no declared region, even where a regional parent was inferred in Inventory.
-
-`SourceRegionOnly` filters before indexing, so inbound references from unrelated
-regions, late shared-plan resolution and some target resolution can be missed.
-It includes global/blank locations and known storage/Cosmos region fields as
-additional context, but does not guarantee tenant-wide dependency coverage.
+There is **no dependency analysis**: the collector does not traverse arbitrary
+properties for references, build relationship graphs, or produce inbound/
+outbound, cross-region or dependency-impact reports. Selected service metadata
+can still include plan, subnet or identity IDs, but these are inventory fields,
+not resolved dependency evidence. Use separately approved tools and
+workload-owner validation for dependency assessment.
 
 ## Scale and output handling
 
@@ -374,8 +368,9 @@ additional context, but does not guarantee tenant-wide dependency coverage.
 - Full resource properties exist only in the current ARG page in memory.
   The persisted staging/output uses selected normalized metadata, not complete
   arbitrary property bags, app settings, passwords, keys or secret values.
-- A compact resource-ID/SKU/location index stays in RAM for cross-region
-  resolution. Memory is **not constant**; budget several GB for very large
+- A compact resource-ID/SKU/location index stays in RAM for regional parent
+  placement and App Service plan SKU resolution. Memory is **not constant**;
+  budget several GB for very large
   estates and measure the representative run. Excel cells themselves are streamed
   directly into the compressed XLSX rather than held in an in-memory spreadsheet.
 - Worksheets split at 250,000 data rows by default, and never exceed Excel's
@@ -396,10 +391,10 @@ identity IDs. Tags and other user-controlled metadata can themselves contain
 sensitive information even though secret APIs are never called. Use an
 approved access-controlled output directory, not a broadly shared sync folder.
 
-`Run.json` records `Collecting`, `Completed`, `Partial`, or `Failed`. On a
-subscription failure, collection continues, a clearly marked partial workbook
-is saved, and the script throws a terminating error. Partial rows from failed
-subscriptions can be present; do not use them as a complete inventory.
+`Run.json` records `ResourceScope: Regional` and `Collecting`, `Completed`,
+`Partial`, or `Failed`. On a dataset failure, collection continues, a clearly
+marked partial workbook is saved, and the script throws a terminating error.
+Partial rows from failed datasets can be present; do not use them as a complete inventory.
 Subscriptions failing preflight stop the entire run before inventory creation;
 the partial-workbook behavior applies to failures after preflight succeeds.
 If export fails or the process is interrupted, an `.xlsx.partial` file and JSONL
@@ -467,7 +462,7 @@ each subsequent collection attempt; the collector cannot resume an interrupted r
 | Browser-based login cannot complete | Browser access or authentication flow is restricted | If your organization permits device-code authentication, use `-Login -UseDeviceCode`. If Conditional Access blocks it, use an approved authentication flow with your administrator. |
 | `UseDeviceCode requires Login` | Device-code option was supplied without requesting sign-in | Supply both switches: `-Login -UseDeviceCode`. |
 | `Subscription not visible`, discovery failed or `No subscriptions in the requested scope` | Incorrect tenant/ID, missing subscription visibility, or stale authentication | Sign in to the correct tenant, inspect `Get-AzSubscription`, and verify requested GUIDs and Reader access. Do not remove required subscriptions just to obtain a passing run. |
-| `Cross-tenant arrays are not supported` | Requested IDs are not all visible in the current/selected tenant | Select the correct `-TenantId` and verify access. For IDs belonging to different tenants, run separately per tenant and record the dependency-analysis boundary. The script does not widen scope automatically. |
+| `Cross-tenant arrays are not supported` | Requested IDs are not all visible in the current/selected tenant | Select the correct `-TenantId` and verify access. For IDs belonging to different tenants, run separately per tenant and record each run's scope. The script does not widen scope automatically. |
 | Subscription is `Disabled` or otherwise not `Enabled` | Azure reports a non-Enabled subscription state | The current collector warns, keeps the subscription in ARG scope, records its state, and uses an Enabled subscription for the context. If an older copy still throws `Correct the scope or subscription state`, replace it with the updated collector. Review coverage with the administrator; a successful query does not guarantee Azure exposes all resources in that subscription. |
 | `No Enabled subscription is available in the requested scope` | None of the selected subscriptions can be used for the Azure context | Include an Enabled subscription from the same tenant, or ask the subscription administrator to investigate. With explicit IDs, include both the original IDs and the Enabled ID; this deliberately expands that explicit scope. Do not silently drop the original subscriptions or assume the script reactivates them. |
 
@@ -477,7 +472,7 @@ each subsequent collection attempt; the collector cannot resume an interrupted r
 |---|---|---|
 | `unrecognized arguments: --subscription ...` from an old CLI-based collector | An older copy of the script is running | Replace it with the current self-contained script, which calls `Get-AzLocation` and `Search-AzGraph` rather than Azure CLI, then rerun the script. |
 | `Live ARG preflight failed`, `AuthorizationFailed` or HTTP 403 | Token/tenant mismatch, insufficient RBAC, or another access restriction | Read the original error included in the message. Refresh login for the subscription's tenant and have the administrator verify Reader access at the intended scope. After a role change, allow propagation and rerun preflight. |
-| Tenant subscription-scope limit error | The requested tenant scope exceeds ARG's supported subscription scope | Use explicit smaller `-SubscriptionId` arrays, collecting each to a new output directory, and reconcile them against the intended estate. Partial scopes are deliberately disabled; do not enable `AllowPartialScope` to conceal missing subscriptions. Separate runs cannot resolve dependencies across their boundaries. |
+| Tenant subscription-scope limit error | The requested tenant scope exceeds ARG's supported subscription scope | Use explicit smaller `-SubscriptionId` arrays, collecting each to a new output directory, and reconcile them against the intended estate. Partial scopes are deliberately disabled; do not enable `AllowPartialScope` to conceal missing subscriptions. Separate runs cannot resolve App Service plan SKUs or parent placement across their boundaries. |
 | SSL/certificate, proxy, DNS, connection or timeout errors | Corporate proxy/VPN/firewall or certificate trust is preventing Azure access | Confirm access to the configured Azure cloud through your approved network. Ask IT to verify PowerShell/.NET proxy configuration and trusted enterprise certificates. Do not disable TLS verification. |
 | `429`, `TooManyRequests`, or transient 502/503/504 warnings | Azure throttling or a transient service failure | Allow the built-in bounded retries to finish. If exhausted, reduce competing inventory jobs, wait and rerun with a new output path. Splitting subscription batches can reduce competing load; keep records of the full intended scope. |
 | `Unknown source region` / `Unknown target region` | A display name or misspelled region was supplied | Use the canonical `Location` from `Get-AzLocation`, such as `southeastasia`, not `Southeast Asia`. |
@@ -513,7 +508,7 @@ subscription; compare the scope against the client's authoritative inventory.
 | `Output directory already exists` | A previous run used that path | Omit `-OutputDirectory` to use a new timestamped folder under the current directory, or choose a new relative path such as `.\SEA-retry-01`. Keep previous evidence rather than overwriting it. |
 | `Output parent is not writable`, access denied, or path errors | Filesystem permissions, an invalid path or a protected folder | Choose an approved, access-controlled local filesystem path. Check `Get-Location` to confirm where relative paths resolve. A successful parent probe does not guarantee permissions for every later file operation. |
 | Export fails with a file-lock, I/O or disk-space error | Open handles, sync software, insufficient space or storage failure | Close applications holding the affected output, check free space and use an approved nonsynchronized folder if sync interference is suspected. Retry to a new path; do not delete unrelated files or previous inventories. |
-| Memory exhaustion or very slow collection | Large resource index, large metadata, limited RAM or API throttling | Use 64-bit PowerShell with sufficient RAM and close unnecessary local workloads. Start with representative subscriptions. Batching subscriptions reduces memory but loses dependency resolution across batches; `SourceRegionOnly` also reduces inbound visibility. Document these trade-offs. Lowering worksheet split size does not eliminate the in-memory resource index. |
+| Memory exhaustion or very slow collection | Large regional resource index, large metadata, limited RAM or API throttling | Use 64-bit PowerShell with sufficient RAM and close unnecessary local workloads. Start with representative subscriptions. Batching subscriptions reduces memory but can leave App Service plan SKUs or parent placement unresolved across batches. Lowering worksheet split size does not eliminate the in-memory resource index. |
 | `Summary needs ... data rows; increase RowsPerSheet` | Worksheet split setting is smaller than the summary group count plus its total row | Increase `-RowsPerSheet`, normally back to the default `250000`, without exceeding `1048575`. Rerun to a new output directory. |
 | Only an `.xlsx.partial` file exists, or Excel cannot open it | Export was interrupted or failed | Check `Run.json` and the terminal error. The partial ZIP is not a completed workbook; do not rename it to imply success. Preserve JSONL files for investigation and rerun. |
 | Excel displays a repair warning for a final workbook | File corruption, incomplete transfer, or an export defect | Preserve the original file and any repair report. Compare with the original local output, rerun the offline tests and retry the collection to a new folder. Do not assume repaired or missing rows are complete inventory data. |
@@ -532,6 +527,17 @@ subscription; compare the scope against the client's authoritative inventory.
   then fix the reported dataset/scope failures. Some rows may already have been
   saved from a failed token chain. Do not present that workbook as a complete
   estate inventory; rerun to a new output folder after remediation.
+  The final exception now includes the original collection errors, which are
+  also saved under `CollectionErrors` in `Run.json`. A completed Excel export
+  does not turn an incomplete collection into a successful inventory.
+- **A duplicate backup restore-point collection ID appears during paging:**
+  this is a collection consistency error, not an Excel export error. The estate
+  or ARG index may have changed between pages; the duplicate alone does not
+  establish the cause. Retry to a new output folder during a quieter backup/
+  deployment window. If a full-estate scan takes too long, consider
+  explicit smaller subscription arrays; collection already uses a regional
+  resource filter. Document the scope and SKU/parent-lookup boundaries. Do not silently drop
+  duplicates or exclude backup resources to label an inventory complete.
 - **`Run.json` says `Collecting` after the process has stopped:** the process
   likely terminated before it could record completion. `Failed` records a
   handled failure; `Partial` records collection failures with an exported
@@ -542,12 +548,11 @@ subscription; compare the scope against the client's authoritative inventory.
   location of its resources. Count reconciliation validates the queried visible
   scope, not the client's full estate.
 - **App SKU unknown:** confirm the referenced App Service plan is visible and
-  included in the subscription scope. Prefer `AllAccessibleRegions` for
-  cross-region shared plans. Some services genuinely have no exposed resource SKU.
-- **Unresolved dependencies or no dependency rows:** confirm both ends are
-  visible and use `AllAccessibleRegions` for inbound discovery. Not all
-  subresources are independently indexed. FQDNs, connection strings and runtime
-  traffic are intentionally not discovered; no rows does not mean no dependencies.
+  included in the regional resource/subscription scope. No unrelated-region
+  resource lookup is performed. Some services genuinely have no exposed resource SKU.
+- **Missing dependency worksheets or `DependencyScope` parameter errors:**
+  dependency analysis and its parameter/outputs have been removed. Remove
+  `-DependencyScope` from older commands; the current collector is regional-only.
 - **Resources appear in `GlobalContext` instead of `Inventory`:** global or
   regionless resources are not automatically source-region workloads. Review
   global routing and unspecified placement manually; do not count every global
@@ -594,7 +599,7 @@ empty/exact-page scopes, duplicates, malformed responses, count mismatches, retr
 tenant-default and combined-array scope/context forwarding, cross-tenant array
 rejection, context restoration,
 service-specific SKUs, late cross-subscription plan resolution, secondary-region
-storage, inherited child location, inbound/cross-region references, partial
+storage, inherited child location, regional filtering and absence of dependency outputs, partial
 failures, worksheet splitting, XML validity, formula injection prevention,
 text limits, and cached formula totals.
 The tests also copy only the collector into an isolated folder and execute its

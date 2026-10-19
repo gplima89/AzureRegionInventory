@@ -189,14 +189,12 @@ try {
             Assert-True (($cosmosRow.AdditionalRegions -split ';').Count -eq $locationCount -and ($cosmosRow.AdditionalRegions -split ';') -contains 'eastasia') "Cosmos iterates $locationCount region entries rather than the array wrapper."
             Assert-True ($cosmosRow.ImpactScope -eq $(if ($locationCount -eq 2) {'SecondaryRegion'} else {'GlobalContext'})) 'Cosmos secondary-region impact follows the individual location entries.'
         }
-        $refs = @(Get-ArmReferences -Value @{
-            subnet = @{ id = "$prefixA/Microsoft.Network/virtualNetworks/vnet/subnets/default" }
-            credential = "Password=secret;Resource=$planId"
-            identities = @{ $planId = @{} }
-        })
-        Assert-True ($refs.Count -eq 2) 'Only exact ARM values or identity keys; no connection string matching.'
-        Assert-True ((Resolve-IndexedResource "$planId/child/one" $index).Id -eq $planId) 'Subresource ancestor resolves.'
 
+
+
+
+        Assert-True ((Get-RegionalResourceQuery southeastasia) -match "^Resources \| where location =~ 'southeastasia'") 'Regional queries filter before projection and pagination.'
+        Assert-Throws { Get-RegionalResourceQuery "southeastasia' or true" } 'pattern'
         $testState.graphAttempts = 0
         $testState.graphHandler = {
             param($a)
@@ -231,7 +229,7 @@ try {
             Assert-True ($normalized.data.Count -eq 0) 'Native empty response retains its wrapper instead of becoming null.'
         }
 
-        # Full offline orchestration: >1000 resources, late cross-subscription plan, inbound reference and secondary region.
+        # Full offline orchestration: >1000 resources, late cross-subscription plan and secondary region.
         function New-TestResource {
             param($Id, $Type, $Location, $Properties = @{}, $Sku = $null)
             @{ id = $Id; name = ($Id -split '/')[-1]; type = $Type; location = $Location
@@ -254,17 +252,21 @@ try {
         $resourcesA.Insert(0, $resourcesA[$resourcesA.Count - 1])
         $resourcesA.RemoveAt($resourcesA.Count - 1)
         $resourcesB = @(
-            New-TestResource $planId 'microsoft.web/serverfarms' 'eastasia' @{} @{ name = 'P1v3'; tier = 'PremiumV3'; capacity = 3 }
+            New-TestResource $planId 'microsoft.web/serverfarms' 'southeastasia' @{} @{ name = 'P1v3'; tier = 'PremiumV3'; capacity = 3 }
             New-TestResource "$prefixB/Microsoft.Example/consumers/consumer" 'microsoft.example/consumers' 'eastasia' @{ upstreamId = $appId }
         )
         $testState.testResources = @{ $subA = @($resourcesA.ToArray()); $subB = $resourcesB }
         $testState.simulateFailure = $false
         $testState.simulateResourceFailure = $false
+        $testState.simulateResourceDuplicate = $false
         $testState.graphCalls = [Collections.Generic.List[object]]::new()
         $testState.graphHandler = {
             param($a)
             $testState.graphCalls.Add(@{} + $a)
             $q = $a.Query
+            if ($q -match '^Resources' -and $q -notmatch "^Resources \| where location =~ '([^']+)'") {
+                throw 'Resource queries must retain their regional filter, including preflight counts.'
+            }
             if ($a.DefaultProfile.Tenant.Id -ne 'tenant-a') { throw 'Context tenant does not match query scope' }
             if ($a.ContainsKey('Subscription') -and $a.ContainsKey('UseTenantScope')) { throw 'Mutually exclusive graph scopes supplied' }
             $ids = if ($a.ContainsKey('UseTenantScope')) { @($subA, $subB) } else { @($a.Subscription) }
@@ -278,12 +280,32 @@ try {
                         subscriptionId = $sub; location = 'eastasia'; tags = @{ Owner = 'Test' } }
                 } else { $testState.testResources[$sub] }
             })
+            if ($q -match "^Resources \| where location =~ '([^']+)'") {
+                $region = $Matches[1]
+                $all = @($all | Where-Object {
+                    $resource = $_
+                    $secondaryRegions = @(
+                        Get-Field $resource.properties 'primaryLocation'
+                        Get-Field $resource.properties 'secondaryLocation'
+                    )
+                    $resourceLocations = Get-Field $resource.properties 'locations'
+                    foreach ($resourceLocation in $resourceLocations) {
+                        $secondaryRegions += Get-Field $resourceLocation 'locationName'
+                    }
+                    $secondaryRegions = @($secondaryRegions | Where-Object { $_ } | ForEach-Object { $_.Replace(' ', '').ToLowerInvariant() })
+                    $resource.location -ieq $region -or $resource.location -ieq 'global' -or
+                        -not $resource.location -or $region -in $secondaryRegions
+                })
+            }
             $all = @($all | Sort-Object id)
             if ($q -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = $all.Count }) }
             $start = if ($a.ContainsKey('SkipToken')) { [int]$a.SkipToken } else { 0 }
             $last = [Math]::Min($start + $a.First, $all.Count)
             $data = @()
             if ($all.Count) { $data = @($all[$start..($last - 1)]) }
+            if ($testState.simulateResourceDuplicate -and $q -match '^Resources' -and $start -gt 0) {
+                $data[0] = $all[0]
+            }
             New-TestGraphPage $data $(if ($last -lt $all.Count) { [string]$last } else { $null })
         }
         $testState.completeHandler = $testState.graphHandler
@@ -396,11 +418,13 @@ try {
         $testState.graphHandler = $testState.completeHandler
         $out = Join-Path $TestRoot 'complete'
         $testState.graphCalls.Clear()
-        $run = Invoke-RegionalInventory -SourceRegion southeastasia -TargetRegion eastasia -OutputDirectory $out -RowsPerSheet 1000
+        $run = Invoke-RegionalInventory -SourceRegion southeastasia -TargetRegion eastasia -OutputDirectory $out -RowsPerSheet 1000 -InformationVariable runProgress
+        $runMessages = ($runProgress | ForEach-Object { [string]$_.MessageData }) -join "`n"
+        Assert-True ($runMessages -match 'Retrieved ResourceGroups page' -and $runMessages -match 'Retrieved Resources page') 'Collection progress distinguishes resource groups from resources.'
         Assert-True ($testState.graphCalls.Count -eq 7) 'Two-subscription tenant run uses only seven graph count/page calls.'
         Assert-True (@($testState.graphCalls | Where-Object { -not $_.ContainsKey('UseTenantScope') -or $_.ContainsKey('Subscription') }).Count -eq 0) 'Every default graph query uses tenant scope.'
         Assert-True (@($testState.graphCalls | Where-Object { $_.Query -notmatch 'summarize' -and $_.Query -match '^Resources' }).Count -eq 2) 'One resource token chain covers resources across two subscriptions.'
-        Assert-True ($run.ImpactedResources -eq 1004 -and $run.IndexedResources -eq 1007) 'Full run selects primary, secondary and inherited resources, not every region.'
+        Assert-True ($run.ImpactedResources -eq 1005 -and $run.IndexedResources -eq 1006) 'Regional run includes primary, secondary, inherited and global context, but excludes unrelated-region resources.'
         $inventory = @(Get-JsonLines (Join-Path $out 'Inventory.jsonl'))
         $appRow = @($inventory | Where-Object { $_.ResourceId -eq $appId })[0]
         Assert-True ($appRow.SkuName -eq 'P1v3') 'Late plan resolution updates final app inventory.'
@@ -408,21 +432,23 @@ try {
         Assert-True (@(Get-JsonLines (Join-Path $out 'ResourceGroups.jsonl')).Count -eq 2) 'Resource-group dataset collected independently of workload region.'
         $slotRow = @($inventory | Where-Object { $_.ResourceType -eq 'microsoft.web/sites/slots' })[0]
         Assert-True ($slotRow.ImpactScope -eq 'InheritedParentRegion' -and $slotRow.EffectiveRegion -eq 'southeastasia') 'Regionless child inherits indexed parent region.'
-        $edges = @(Get-JsonLines (Join-Path $out 'Dependencies.jsonl'))
-        Assert-True (@($edges | Where-Object { $_.ImpactDirection -eq 'Inbound to impacted' }).Count -eq 1) 'Inbound consumers from other regions included.'
-        Assert-True (@($edges | Where-Object { $_.CrossRegion -eq 'Yes' }).Count -eq 2) 'Known cross-region references are flagged; blank child locations remain unspecified.'
+        foreach ($removedFile in @('Dependencies.jsonl','DependencyImpact.jsonl','ReferenceStaging.jsonl')) {
+            Assert-True (-not (Test-Path (Join-Path $out $removedFile))) "Removed dependency output is not generated: $removedFile."
+        }
+        Assert-True (@($testState.graphCalls | Where-Object { $_.Query -match '^Resources' -and $_.Query -notmatch '^Resources \| where' }).Count -eq 0) 'Every resource count and page query is region-filtered.'
         Assert-True (-not (Test-Path (Join-Path $out 'InventoryStaging.jsonl'))) 'Staging cleaned after success.'
         $manifest = Get-Content (Join-Path $out 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($manifest.Status -eq 'Completed') 'Successful manifest.'
+        Assert-True ($manifest.ResourceScope -eq 'Regional' -and 'DependencyScope' -notin $manifest.PSObject.Properties.Name) 'Manifest declares regional collection without a dependency-analysis mode.'
         Assert-True ($manifest.ScopeType -eq 'Tenant' -and $manifest.TenantId -eq 'tenant-a' -and $manifest.SubscriptionsRequested.Count -eq 0) 'Default manifest records tenant scope without an implicit explicit subscription list.'
         $audits = @(Get-JsonLines (Join-Path $out 'ScopeAudit.jsonl'))
         Assert-True ($audits.Count -eq 2 -and @($audits | Where-Object { $_.ScopeType -ne 'Tenant' -or $_.Status -ne 'CountReconciled' }).Count -eq 0) 'Audit has one aggregate row per dataset rather than per subscription.'
-        Assert-True (@($audits | Where-Object { $_.Dataset -eq 'Resources' -and $_.Downloaded -eq 1007 -and $_.Pages -eq 2 }).Count -eq 1) 'Aggregate resource audit has exact count and page total.'
+        Assert-True (@($audits | Where-Object { $_.Dataset -eq 'Resources' -and $_.Downloaded -eq 1006 -and $_.Pages -eq 2 }).Count -eq 1) 'Aggregate regional resource audit has exact count and page total.'
         Assert-True (Test-Path (Join-Path $out 'Preflight.json')) 'Successful preflight checks saved alongside inventory.'
         $arrayOut = Join-Path $TestRoot 'array-scope'
         $testState.graphCalls.Clear()
         $arrayRun = Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId @($subA,$subB) -OutputDirectory $arrayOut
-        Assert-True ($arrayRun.IndexedResources -eq 1007 -and $testState.graphCalls.Count -eq 7) 'Explicit array collects both subscriptions through one aggregate token chain.'
+        Assert-True ($arrayRun.IndexedResources -eq 1006 -and $testState.graphCalls.Count -eq 7) 'Explicit array collects regional resources from both subscriptions through one aggregate token chain.'
         Assert-True (@($testState.graphCalls | Where-Object { $_.ContainsKey('UseTenantScope') -or $_.Subscription.Count -ne 2 }).Count -eq 0) 'Every explicit-array query retains the same full array without tenant expansion.'
         $arrayManifest = Get-Content (Join-Path $arrayOut 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($arrayManifest.ScopeType -eq 'Subscriptions' -and $arrayManifest.SubscriptionsRequested.Count -eq 2) 'Explicit-array scope is persisted accurately.'
@@ -430,7 +456,7 @@ try {
         $stateOut = Join-Path $TestRoot 'disabled-subscription'
         $stateRun = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $stateOut
         $stateManifest = Get-Content (Join-Path $stateOut 'Run.json') -Raw | ConvertFrom-Json
-        Assert-True ($stateManifest.Status -eq 'Completed' -and $stateRun.IndexedResources -eq 1007 -and $stateManifest.SubscriptionsDiscovered -contains $subB) 'A disabled subscription does not stop collection or remove its resources.'
+        Assert-True ($stateManifest.Status -eq 'Completed' -and $stateRun.IndexedResources -eq 1006 -and $stateManifest.SubscriptionsDiscovered -contains $subB) 'A disabled subscription does not stop collection or remove its regional resources.'
         Assert-True ($stateManifest.NonEnabledSubscriptions.Count -eq 1 -and $stateManifest.NonEnabledSubscriptions[0].id -eq $subB -and $stateManifest.NonEnabledSubscriptions[0].state -eq 'Disabled') 'Run manifest persists the non-Enabled subscription and state.'
         $stateCoverage = @(Get-JsonLines (Join-Path $stateOut 'Coverage.jsonl'))
         Assert-True (@($stateCoverage | Where-Object { $_.Topic -eq 'Subscription states' -and $_.Notes -match $subB -and $_.Notes -match 'not proof of complete inventory' }).Count -eq 1) 'Workbook coverage records the subscription-state visibility caveat.'
@@ -446,7 +472,7 @@ try {
             $arrayMetadataRun = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $arrayMetadataOut
             $arrayMetadataManifest = Get-Content (Join-Path $arrayMetadataOut 'Run.json') -Raw | ConvertFrom-Json
             $arrayMetadataInventory = @(Get-JsonLines (Join-Path $arrayMetadataOut 'Inventory.jsonl'))
-            Assert-True ($arrayMetadataManifest.Status -eq 'Completed' -and $arrayMetadataRun.IndexedResources -eq 1009 -and $arrayMetadataRun.ImpactedResources -eq 1006) 'AKS and Cosmos array metadata complete a full paged run without partial inventory.'
+            Assert-True ($arrayMetadataManifest.Status -eq 'Completed' -and $arrayMetadataRun.IndexedResources -eq 1008 -and $arrayMetadataRun.ImpactedResources -eq 1007) 'AKS and Cosmos array metadata complete a full regional paged run without partial inventory.'
             $aksRow = @($arrayMetadataInventory | Where-Object { $_.ResourceId -eq $aksId })[0]
             Assert-True ((ConvertFrom-Json -InputObject $aksRow.ServiceDetailsJson -AsHashtable).NodePools.Count -eq 2) 'Final inventory retains both AKS node pools.'
             Assert-True (@($arrayMetadataInventory | Where-Object { $_.ResourceId -eq $cosmos.id -and $_.ImpactScope -eq 'SecondaryRegion' }).Count -eq 1) 'Final inventory includes the Cosmos account through its secondary region.'
@@ -469,13 +495,14 @@ try {
             $reader = [IO.StreamReader]::new($entry.Open())
             try { $wb = [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
             Assert-True ('Inventory_2' -in @($wb.workbook.sheets.sheet.name)) 'Inventory sheets split at requested threshold.'
+            Assert-True (@($wb.workbook.sheets.sheet.name).Count -eq 8 -and 'Dependencies' -notin @($wb.workbook.sheets.sheet.name) -and 'DependencyImpact' -notin @($wb.workbook.sheets.sheet.name)) 'Workbook contains only the seven inventory/report sheets plus the split inventory remainder.'
             $entry = $zip.GetEntry('xl/worksheets/sheet1.xml')
             $reader = [IO.StreamReader]::new($entry.Open())
             try { $summary = [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
             $ns = [Xml.XmlNamespaceManager]::new($summary.NameTable)
             $ns.AddNamespace('s', $summary.DocumentElement.NamespaceURI)
             $totals = $summary.SelectNodes('//s:c[s:f]', $ns)
-            Assert-True ($totals.Count -eq 3 -and $totals[0].v -eq '1004') 'Summary formula totals have correct cached values.'
+            Assert-True ($totals.Count -eq 3 -and $totals[0].v -eq '1005') 'Summary formula totals have correct cached values.'
         }
         finally { $zip.Dispose() }
         if (Get-Module -ListAvailable ImportExcel) {
@@ -483,10 +510,10 @@ try {
             $package = Open-ExcelPackage -Path $run.Workbook
             try {
                 Assert-True ($package.Workbook.Worksheets['Inventory'].Dimension.Rows -eq 1001) 'Independent EPPlus reader opens first inventory worksheet.'
-                Assert-True ($package.Workbook.Worksheets['Inventory_2'].Dimension.Rows -eq 5) 'Independent reader sees exact split remainder.'
-                Assert-True ($package.Workbook.Worksheets['Summary'].Cells['E6'].Value -eq 1004) 'Independent reader sees cached total.'
+                Assert-True ($package.Workbook.Worksheets['Inventory_2'].Dimension.Rows -eq 6) 'Independent reader sees exact split remainder.'
+                Assert-True ($package.Workbook.Worksheets['Summary'].Cells['E7'].Value -eq 1005) 'Independent reader sees cached total.'
                 [OfficeOpenXml.CalculationExtension]::Calculate($package.Workbook)
-                Assert-True ($package.Workbook.Worksheets['Summary'].Cells['E6'].Value -eq 1004) 'Independent engine recalculates formula total.'
+                Assert-True ($package.Workbook.Worksheets['Summary'].Cells['E7'].Value -eq 1005) 'Independent engine recalculates formula total.'
             }
             finally { $package.Dispose() }
         }
@@ -509,12 +536,46 @@ try {
             Assert-True ($x.worksheet.sheetData.row[3].c.is.t.InnerText.Length -le 32767) 'Unicode truncation preserves surrogate pairs.'
         }
         finally { $zip.Dispose() }
+        $progressPath = Join-Path $TestRoot 'progress.jsonl'
+        $progressWriter = New-JsonLineWriter $progressPath
+        try {
+            for ($i = 0; $i -lt 1001; $i++) { Write-JsonLine $progressWriter @{ Value = $i } }
+        }
+        finally { $progressWriter.Dispose() }
+        $emptyPath = Join-Path $TestRoot 'empty.jsonl'
+        [IO.File]::WriteAllText($emptyPath, '')
+        $progressSheets = Export-StreamingWorkbook -Path (Join-Path $TestRoot 'progress.xlsx') -RowsPerSheet 1000 -Sheets @(
+            @{ Name = 'Progress'; Path = $progressPath; Columns = @('Value') }
+            @{ Name = 'Empty'; Path = $emptyPath; Columns = @('Value') }
+        ) -InformationVariable exportProgress
+        $exportMessages = ($exportProgress | ForEach-Object { [string]$_.MessageData }) -join "`n"
+        Assert-True ($progressSheets.Count -eq 3 -and $progressSheets[1] -eq 'Progress_2') 'Export progress does not contaminate the returned worksheet-name array.'
+        Assert-True ($exportMessages -match 'Excel dataset 1/2: Progress' -and $exportMessages -match 'Excel dataset 2/2: Empty') 'Export announces dataset position and name.'
+        Assert-True ($exportMessages.Contains("Excel 'Progress': $((1000).ToString('N0')) rows;") -and $exportMessages -match 'elapsed [0-9]') 'Export reports row activity at the 1000-row checkpoint with elapsed time.'
+        Assert-True ($exportMessages -match "Finished worksheet 'Progress_2': 1 rows" -and $exportMessages -match "Finished worksheet 'Empty': 0 rows") 'Export reports split remainders and empty worksheets correctly.'
+        Assert-True ($exportMessages -match 'Finalizing Excel metadata' -and $exportMessages -match 'Closing Excel ZIP archive' -and $exportMessages.Contains("Workbook export complete: $((1001).ToString('N0')) data rows")) 'Export reports finalization, archive closing and exact total data rows.'
+        $invalidPath = Join-Path $TestRoot 'invalid.jsonl'
+        [IO.File]::WriteAllText($invalidPath, '{invalid')
+        $invalidWorkbook = Join-Path $TestRoot 'invalid.xlsx.partial'
+        $invalidFailure = ''
+        try {
+            $null = Export-StreamingWorkbook -Path $invalidWorkbook -Sheets @(
+                @{ Name = 'Invalid'; Path = $invalidPath; Columns = @('Value') }
+            ) -InformationVariable failedExportProgress
+        }
+        catch { $invalidFailure = $_.Exception.Message }
+        $failedMessages = ($failedExportProgress | ForEach-Object { [string]$_.MessageData }) -join "`n"
+        Assert-True ($invalidFailure -match 'JSON' -and $failedMessages -notmatch 'Workbook export complete') 'Failed export surfaces its error without announcing completion.'
+        $unlocked = [IO.File]::Open($invalidWorkbook, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $unlocked.Dispose()
+        Assert-True ($failedMessages -match 'Closing Excel ZIP archive') 'Failed export closes the archive and releases its file handle.'
         $testState.simulateFailure = $true
         $partialOut = Join-Path $TestRoot 'partial'
-        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $partialOut } 'PARTIAL inventory saved'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $partialOut } '(?s)PARTIAL inventory saved.*\[ResourceContainers\] AuthorizationFailed test fixture'
         $partial = Get-Content (Join-Path $partialOut 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($partial.Status -eq 'Partial' -and (Test-Path (Join-Path $partialOut 'RegionalInventory.xlsx'))) 'Partial workbook preserved with explicit failure status.'
-        Assert-True ($partial.ScopeFailures -eq 1 -and $partial.IndexedResources -eq 1007) 'A failed group dataset does not prevent resource inventory collection.'
+        Assert-True ($partial.ScopeFailures -eq 1 -and $partial.IndexedResources -eq 1006) 'A failed group dataset does not prevent regional resource inventory collection.'
+        Assert-True ($partial.CollectionErrors.Count -eq 1 -and $partial.CollectionErrors[0].Stage -eq 'ResourceContainers') 'Partial manifest persists the original dataset error.'
         $testState.simulateFailure = $false
         $testState.simulateResourceFailure = $true
         $resourcePartialOut = Join-Path $TestRoot 'resource-partial'
@@ -522,6 +583,12 @@ try {
         $resourcePartial = Get-Content (Join-Path $resourcePartialOut 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($resourcePartial.Status -eq 'Partial' -and $resourcePartial.IndexedResources -eq 1000) 'Continuation failure preserves partial rows without claiming success.'
         $testState.simulateResourceFailure = $false
+        $testState.simulateResourceDuplicate = $true
+        $duplicateOut = Join-Path $TestRoot 'duplicate-partial'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $duplicateOut } '(?s)PARTIAL inventory saved.*\[Resources\] Duplicate resource ID while paging'
+        $duplicateManifest = Get-Content (Join-Path $duplicateOut 'Run.json') -Raw | ConvertFrom-Json
+        Assert-True ($duplicateManifest.Status -eq 'Partial' -and $duplicateManifest.CollectionErrors[0].Message -match 'Duplicate resource ID') 'Duplicate paging errors remain explicit in both the final exception and manifest.'
+        $testState.simulateResourceDuplicate = $false
         $testState.filteredCalls = [Collections.Generic.List[object]]::new()
         $testState.graphHandler = {
             param($a)
@@ -529,10 +596,11 @@ try {
             & $testState.completeHandler $a
         }
         $filteredOut = Join-Path $TestRoot 'filtered'
-        $null = Invoke-RegionalInventory -SourceRegion southeastasia -DependencyScope SourceRegionOnly -OutputDirectory $filteredOut
+        $null = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $filteredOut
         Assert-True (@($testState.filteredCalls | Where-Object {
             $_.Query -match '^Resources \| where .*summarize'
         }).Count -eq 2) 'Filtered tenant scope runs one initial and one final filtered count, not per-subscription counts.'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -DependencyScope SourceRegionOnly -OutputDirectory $checkPath } 'parameter.*DependencyScope'
         # Execute the actual entry point from a folder containing only the collector.
         $standaloneFolder = Join-Path $TestRoot 'standalone'
         $null = New-Item -ItemType Directory -Path $standaloneFolder

@@ -6,7 +6,7 @@ Creates an Azure regional migration inventory and Excel workbook using Az PowerS
 .DESCRIPTION
 Self-contained, read-only collector. Requires Az.Accounts, Az.ResourceGraph and
 Az.Resources. Queries the current/selected tenant in pages of up to 1000 resources,
-normalizes service-specific SKUs, correlates configured dependencies and exports
+filters for regional impact, normalizes service-specific SKUs and exports
 an Excel workbook plus JSONL companions. No companion script, Azure CLI or Excel
 installation is required.
 .PARAMETER SourceRegion
@@ -27,8 +27,6 @@ Signs in with Connect-AzAccount. Omit when an Az PowerShell session already exis
 Uses device authentication with Login, subject to organizational policy.
 .PARAMETER CheckOnly
 Validates prerequisites and live read access without collecting inventory files.
-.PARAMETER DependencyScope
-AllAccessibleRegions preserves inbound dependency discovery. SourceRegionOnly is narrower.
 .PARAMETER RowsPerSheet
 Maximum data rows per worksheet. Default 250000; summary must fit on one sheet.
 .EXAMPLE
@@ -48,7 +46,6 @@ param(
     [switch]$Login,
     [switch]$UseDeviceCode,
     [switch]$CheckOnly,
-    [ValidateSet('AllAccessibleRegions', 'SourceRegionOnly')][string]$DependencyScope = 'AllAccessibleRegions',
     [ValidateRange(1, 1048575)][int]$RowsPerSheet = 250000
 )
 Set-StrictMode -Version Latest
@@ -138,6 +135,11 @@ function Get-ArgCount {
     return [long]$response.data[0].ResourceCount
 }
 
+function Get-RegionalResourceQuery {
+    param([Parameter(Mandatory)][ValidatePattern('^[a-z0-9]+$')][string]$SourceRegion)
+    return "Resources | where location =~ '$SourceRegion' or location =~ 'global' or isempty(location) or replace_string(tolower(tostring(properties.locations)), ' ', '') contains '$SourceRegion' or properties.primaryLocation =~ '$SourceRegion' or properties.secondaryLocation =~ '$SourceRegion'"
+}
+
 function Invoke-ArgPaged {
     param(
         [string[]]$SubscriptionId,
@@ -146,7 +148,8 @@ function Invoke-ArgPaged {
         [Parameter(Mandatory)][scriptblock]$OnPage,
         [ValidateRange(1, 1000)][int]$PageSize = 1000,
         [ValidateRange(0, [long]::MaxValue)][long]$InitialCount,
-        $DefaultProfile
+        $DefaultProfile,
+        [string]$DatasetName = 'Resources'
     )
     $expected = if ($PSBoundParameters.ContainsKey('InitialCount')) { $InitialCount }
         else { Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile }
@@ -172,7 +175,7 @@ function Invoke-ArgPaged {
         $token = $response['skipToken']
         if ($token -and -not $tokens.Add([string]$token)) { throw 'ARG returned a repeated continuation token.' }
         if ($token -and $rows.Count -eq 0) { throw 'ARG returned an empty page with a continuation token.' }
-        Write-Host "  Retrieved page $pages ($($rows.Count) resource(s)); total so far: $($seen.Count)/$expected [$scopeLabel]" -ForegroundColor DarkGray
+        Write-Host "  Retrieved $DatasetName page $pages ($($rows.Count) row(s)); total so far: $($seen.Count)/$expected [$scopeLabel]" -ForegroundColor DarkGray
     } while ($token)
     $after = Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile
     if ($seen.Count -ne $expected -or $after -ne $expected) {
@@ -183,7 +186,7 @@ function Invoke-ArgPaged {
 
 #endregion
 
-#region Service metadata and dependency helpers
+#region Service metadata and inventory helpers
 function Get-Field {
     param($Object, [string]$Path)
     $current = $Object
@@ -357,42 +360,6 @@ function Get-ServiceProfile {
     }
 }
 
-function Get-ArmReferences {
-    param($Value, [string]$Path = 'properties', [int]$Depth = 0)
-    if ($Depth -gt 100) { throw "Dependency traversal exceeded depth 100 at $Path." }
-    if ($Value -is [string]) {
-        # Only explicit IDs, not arbitrary matches in connection strings, scripts or secret text.
-        if ($Value -match '^/subscriptions/[0-9a-fA-F-]{36}(?:/resourceGroups/[^/]+)?/providers/[^/\s]+/[^?\s#]+$') {
-            [pscustomobject]@{ TargetId = $Value.TrimEnd('/'); Path = $Path }
-        }
-    }
-    elseif ($Value -is [Collections.IDictionary]) {
-        foreach ($key in $Value.Keys) {
-            if ([string]$key -match '^/subscriptions/') { Get-ArmReferences -Value ([string]$key) -Path "$Path{key}" -Depth ($Depth + 1) }
-            Get-ArmReferences -Value $Value[$key] -Path "$Path.$key" -Depth ($Depth + 1)
-        }
-    }
-    elseif ($Value -is [Collections.IEnumerable]) {
-        $i = 0
-        foreach ($item in $Value) {
-            Get-ArmReferences -Value $item -Path "$Path[$i]" -Depth ($Depth + 1)
-            $i++
-        }
-    }
-}
-
-function Resolve-IndexedResource {
-    param([string]$Id, [Collections.Generic.Dictionary[string, object]]$Index)
-    $candidate = $Id.TrimEnd('/')
-    while ($candidate -match '/providers/') {
-        if ($Index.ContainsKey($candidate)) { return $Index[$candidate] }
-        $slash = $candidate.LastIndexOf('/')
-        if ($slash -lt 0) { break }
-        $candidate = $candidate.Substring(0, $slash)
-    }
-    return $null
-}
-
 function New-JsonLineWriter {
     param([string]$Path)
     [IO.StreamWriter]::new($Path, $false, [Text.UTF8Encoding]::new($false))
@@ -502,6 +469,7 @@ function Write-ExcelCell {
 }
 
 function Export-StreamingWorkbook {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][object[]]$Sheets,
@@ -511,8 +479,13 @@ function Export-StreamingWorkbook {
     $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create)
     $sheetNames = [Collections.Generic.List[string]]::new()
     $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $totalRows = 0L
+    $datasetNumber = 0
     try {
         foreach ($sheet in $Sheets) {
+            $datasetNumber++
+            Write-Host "  Excel dataset $datasetNumber/$($Sheets.Count): $($sheet.Name)"
             $columnNames = @(for ($col = 1; $col -le $sheet.Columns.Count; $col++) { Get-ExcelColumnName $col })
             $reader = [IO.StreamReader]::new($sheet.Path)
             try {
@@ -524,6 +497,8 @@ function Export-StreamingWorkbook {
                     $name = $sheet.Name.Substring(0, [Math]::Min($sheet.Name.Length, 31 - $suffix.Length)) + $suffix
                     $sheetNames.Add($name)
                     $sheetNumber = $sheetNames.Count
+                    Write-Host "    Writing worksheet '$name' ..."
+                    $lastReportMilliseconds = $timer.ElapsedMilliseconds
                     $entry = $zip.CreateEntry("xl/worksheets/sheet$sheetNumber.xml", [IO.Compression.CompressionLevel]::Fastest)
                     $settings = [Xml.XmlWriterSettings]::new()
                     $settings.Encoding = [Text.UTF8Encoding]::new($false)
@@ -569,6 +544,13 @@ function Export-StreamingWorkbook {
                                 Write-ExcelCell $writer "$($columnNames[$col - 1])$rowNumber" $data[$sheet.Columns[$col - 1]]
                             }
                             $writer.WriteEndElement()
+                            $totalRows++
+                            if (($rowNumber - 1) % 1000 -eq 0 -or
+                                $timer.ElapsedMilliseconds - $lastReportMilliseconds -ge 5000) {
+                                Write-Host ("    Excel '{0}': {1:N0} rows; {2:N0} total rows; elapsed {3:N1}s" -f
+                                    $name, ($rowNumber - 1), $totalRows, $timer.Elapsed.TotalSeconds)
+                                $lastReportMilliseconds = $timer.ElapsedMilliseconds
+                            }
                             $next = $reader.ReadLine()
                         }
                         $writer.WriteEndElement()
@@ -579,10 +561,13 @@ function Export-StreamingWorkbook {
                         $writer.WriteEndDocument()
                     }
                     finally { $writer.Dispose() }
+                    Write-Host ("    Finished worksheet '{0}': {1:N0} rows; elapsed {2:N1}s" -f
+                        $name, ($rowNumber - 1), $timer.Elapsed.TotalSeconds)
                 } while ($null -ne $next)
             }
             finally { $reader.Dispose() }
         }
+        Write-Host "  Finalizing Excel metadata ($($sheetNames.Count) worksheets; $totalRows total data rows) ..."
         $overrides = ''
         $rels = ''
         $workbookSheets = ''
@@ -610,7 +595,11 @@ function Export-StreamingWorkbook {
 </styleSheet>
 '@
     }
-    finally { $zip.Dispose(); $stream.Dispose() }
+    finally {
+        Write-Host '  Closing Excel ZIP archive ...'
+        try { $zip.Dispose() } finally { $stream.Dispose(); $timer.Stop() }
+    }
+    Write-Host ("  Workbook export complete: {0:N0} data rows in {1:N1}s." -f $totalRows, $timer.Elapsed.TotalSeconds)
     return ,$sheetNames.ToArray()
 }
 
@@ -694,13 +683,13 @@ function Test-InventoryPrerequisites {
     }
     try {
         $context = Set-AzContext -Subscription $enabledAccounts[0].id -Tenant $effectiveTenantId -Scope Process -ErrorAction Stop -Verbose:$false
-        $initialCount = Get-ArgCount -SubscriptionId $requestedIds -BaseQuery 'Resources' -DefaultProfile $context
+        $initialCount = Get-ArgCount -SubscriptionId $requestedIds -BaseQuery (Get-RegionalResourceQuery $SourceRegion) -DefaultProfile $context
     }
     catch {
         throw "Live ARG preflight failed for $scopeLabel. Check Connect-AzAccount, Reader access, Az compatibility and network/proxy access. Tenant subscription-scope limits may require an explicit smaller subscription array; partial scopes are not enabled. Original error: $($_.Exception.Message)"
     }
     finally { $null = Set-AzContext -Context $originalContext -Scope Process -ErrorAction Stop -Verbose:$false }
-    Add-PreflightCheck 'Live Azure Resource Graph access' "$scopeLabel; initial Resources count=$initialCount"
+    Add-PreflightCheck 'Live Azure Resource Graph access' "$scopeLabel; initial regional Resources count=$initialCount"
     $locations = @(Get-AzLocation -DefaultProfile $context -ErrorAction Stop -Verbose:$false)
     $regionNames = @($locations | ForEach-Object { $_.Location })
     if ($SourceRegion -notin $regionNames) { throw "Unknown source region '$SourceRegion'. Use a canonical region name from Get-AzLocation." }
@@ -742,7 +731,6 @@ function Invoke-RegionalInventory {
         [switch]$Login,
         [switch]$UseDeviceCode,
         [switch]$CheckOnly,
-        [ValidateSet('AllAccessibleRegions', 'SourceRegionOnly')][string]$DependencyScope = 'AllAccessibleRegions',
         [ValidateRange(1, 1048575)][int]$RowsPerSheet = 250000
     )
     $ErrorActionPreference = 'Stop'
@@ -764,7 +752,7 @@ function Invoke-RegionalInventory {
     $manifestPath = Join-Path $OutputDirectory 'Run.json'
     $manifest = [ordered]@{
         Status = 'Collecting'; StartedUtc = [DateTime]::UtcNow.ToString('o'); FinishedUtc = ''
-        SourceRegion = $SourceRegion; TargetRegion = $TargetRegion; DependencyScope = $DependencyScope
+        SourceRegion = $SourceRegion; TargetRegion = $TargetRegion; ResourceScope = 'Regional'
         ScopeType = $preflight.ScopeType; TenantId = $preflight.TenantId
         SubscriptionsRequested = $preflight.SubscriptionIds; SubscriptionsDiscovered = @($accounts.id); ScopeFailures = 0
         NonEnabledSubscriptions = $preflight.NonEnabledSubscriptions
@@ -773,25 +761,21 @@ function Invoke-RegionalInventory {
     [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json $manifest -Depth 10))
     $paths = @{}
     $writers = @{}
-    foreach ($name in @('Inventory', 'GlobalContext', 'Dependencies', 'DependencyImpact', 'Summary',
-        'ScopeAudit', 'ResourceGroups', 'Coverage', 'Errors', 'InventoryStaging', 'ReferenceStaging')) {
+    foreach ($name in @('Inventory', 'GlobalContext', 'Summary',
+        'ScopeAudit', 'ResourceGroups', 'Coverage', 'Errors', 'InventoryStaging')) {
         $paths[$name] = Join-Path $OutputDirectory "$name.jsonl"
         $writers[$name] = New-JsonLineWriter $paths[$name]
     }
     $index = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     $impacted = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $groups = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     $stats = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
-    $impactStats = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     $failureCount = 0
     $resourceProjection = 'id, name, type, location, resourceGroup, subscriptionId, kind, sku, tags, zones, managedBy, identity, properties'
-    # Source-region-only still includes explicit multi-region locations and global control-plane context.
-    $regionalFilter = " | where location =~ '$SourceRegion' or location =~ 'global' or isempty(location) or replace_string(tolower(tostring(properties.locations)), ' ', '') contains '$SourceRegion' or properties.primaryLocation =~ '$SourceRegion' or properties.secondaryLocation =~ '$SourceRegion'"
-    $base = if ($DependencyScope -eq 'SourceRegionOnly') { "Resources$regionalFilter" } else { 'Resources' }
+    $base = Get-RegionalResourceQuery $SourceRegion
     try {
-            Write-Host "Collecting $($preflight.ScopeLabel) ..."
+            Write-Host "Collecting $($preflight.ScopeLabel); regional resources for $SourceRegion plus global/regionless and known secondary-region context. Resource-group metadata covers the full selected scope."
             try {
-                $rgAudit = Invoke-ArgPaged @graphOptions -BaseQuery "ResourceContainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups'" `
+                $rgAudit = Invoke-ArgPaged @graphOptions -DatasetName ResourceGroups -BaseQuery "ResourceContainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups'" `
                     -Projection 'id, name, location, subscriptionId, tags' -OnPage {
                         param($rows)
                         foreach ($rg in $rows) {
@@ -817,9 +801,7 @@ function Invoke-RegionalInventory {
             }
             try {
                 $pagingOptions = $graphOptions.Clone()
-                if ($DependencyScope -eq 'AllAccessibleRegions') {
-                    $pagingOptions.InitialCount = $preflight.InitialCount
-                }
+                $pagingOptions.InitialCount = $preflight.InitialCount
                 $audit = Invoke-ArgPaged @pagingOptions -BaseQuery $base -Projection $resourceProjection -OnPage {
                     param($rows)
                     foreach ($r in $rows) {
@@ -842,28 +824,6 @@ function Invoke-RegionalInventory {
                         elseif (-not $r.location -or $r.location -ieq 'global') {
                             Write-JsonLine $writers.InventoryStaging $row
                         }
-                        $references = @(
-                            Get-ArmReferences -Value $r.properties
-                            Get-ArmReferences -Value $r.identity -Path 'identity'
-                            Get-ArmReferences -Value $r.managedBy -Path 'managedBy'
-                        )
-                        $parts = $id -split '/'
-                        if ($parts.Count -ge 11) {
-                            $references += [pscustomobject]@{ TargetId = ($parts[0..($parts.Count - 3)] -join '/'); Path = 'ARM parent (inferred)' }
-                        }
-                        $edgeKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-                        foreach ($ref in $references) {
-                            if ($ref.TargetId -ine $id -and $edgeKeys.Add("$($ref.TargetId)|$($ref.Path)")) {
-                                Write-JsonLine $writers.ReferenceStaging ([ordered]@{
-                                    SourceId = $id; TargetId = $ref.TargetId; EvidencePath = $ref.Path
-                                })
-                            }
-                        }
-                        # AKS node RG is a name, not an ARM ID; correlate resources through RG membership later.
-                        if ($r.type -ieq 'microsoft.containerservice/managedclusters') {
-                            $nodeRg = [string](Get-Field $r.properties 'nodeResourceGroup')
-                            if ($nodeRg) { $groups["$($r.subscriptionId)/$nodeRg"] = $id }
-                        }
                     }
                 }
                 Write-JsonLine $writers.ScopeAudit ($auditScope + @{
@@ -881,7 +841,7 @@ function Invoke-RegionalInventory {
                     Status = 'FAILED - partial rows may be present; not a complete inventory'
                 })
             }
-        Write-Host 'Resolving inventory and dependency references ...'
+        Write-Host 'Finalizing inventory regions and service-specific SKUs ...'
         # Correlate after every page is indexed: cross-subscription plans and late pages can resolve.
         $writers.InventoryStaging.Dispose()
         Get-JsonLines $paths.InventoryStaging | ForEach-Object {
@@ -928,62 +888,6 @@ function Invoke-RegionalInventory {
             if (-not $row.TagsJson -or $row.TagsJson -eq '{}') { $stats[$key].MissingTags++ }
             if ($row.SkuName -eq 'Not exposed / not applicable') { $stats[$key].SkuUnknown++ }
         }
-        foreach ($metadata in $index.Values) {
-            $groupKey = "$($metadata.SubscriptionId)/$($metadata.ResourceGroup)"
-            if ($groups.ContainsKey($groupKey)) {
-                Write-JsonLine $writers.ReferenceStaging ([ordered]@{
-                    SourceId = $metadata.Id; TargetId = $groups[$groupKey]; EvidencePath = 'AKS node resource group membership (inferred)'
-                })
-            }
-        }
-        $writers.ReferenceStaging.Dispose()
-        Get-JsonLines $paths.ReferenceStaging | ForEach-Object {
-            $edge = $_
-            $source = $index[$edge.SourceId]
-            $target = Resolve-IndexedResource $edge.TargetId $index
-            $sourceImpacted = $impacted.Contains($source.Id)
-            $targetImpacted = $null -ne $target -and $impacted.Contains($target.Id)
-            if (-not $sourceImpacted -and -not $targetImpacted) { return }
-            $resolution = if (-not $target) { 'Not visible / not indexed / unsupported / external scope' }
-                elseif ($target.Id -ieq $edge.TargetId) { 'Exact' } else { 'Indexed ancestor; subresource not separately indexed' }
-            $direction = if ($sourceImpacted -and $targetImpacted) { 'Both impacted' }
-                elseif ($sourceImpacted) { 'Outbound from impacted' } else { 'Inbound to impacted' }
-            $crossRegion = if (-not $target) { 'Unknown' }
-                elseif (-not $source.Location -or -not $target.Location -or $source.Location -ieq 'global' -or $target.Location -ieq 'global') { 'Global/unspecified' }
-                elseif ($source.Location -ine $target.Location) { 'Yes' } else { 'No' }
-            $dependency = [ordered]@{
-                SourceId = $source.Id; SourceName = $source.Name; SourceType = $source.Type
-                SourceRegion = $source.Location; SourceSubscriptionId = $source.SubscriptionId
-                TargetId = $edge.TargetId; ResolvedTargetId = if ($target) { $target.Id } else { '' }
-                TargetName = if ($target) { $target.Name } else { '' }
-                TargetType = if ($target) { $target.Type } else { '' }
-                TargetRegion = if ($target) { $target.Location } else { '' }
-                TargetSubscriptionId = if ($target) { $target.SubscriptionId } else { '' }
-                ImpactDirection = $direction; CrossRegion = $crossRegion
-                CrossSubscription = if ($target) { [string]($source.SubscriptionId -ine $target.SubscriptionId) } else { 'Unknown' }
-                Resolution = $resolution; EvidencePath = $edge.EvidencePath
-                EvidenceKind = if ($edge.EvidencePath -match 'inferred') { 'Structural inference' } else { 'Explicit ARM reference' }
-                Interpretation = 'Configuration reference, not proof of runtime traffic or required migration ordering'
-            }
-            Write-JsonLine $writers.Dependencies $dependency
-            foreach ($affected in @(
-                if ($sourceImpacted) { $source.Id }
-                if ($targetImpacted -and $source.Id -ine $target.Id) { $target.Id }
-            )) {
-                if (-not $impactStats.ContainsKey($affected)) {
-                    $impactStats[$affected] = [ordered]@{ ResourceId = $affected; OutboundReferences = 0L; InboundReferences = 0L
-                        CrossRegionReferences = 0L; UnresolvedReferences = 0L }
-                }
-                if ($affected -ieq $source.Id) { $impactStats[$affected].OutboundReferences++ }
-                if ($target -and $affected -ieq $target.Id) { $impactStats[$affected].InboundReferences++ }
-                if ($crossRegion -eq 'Yes') { $impactStats[$affected].CrossRegionReferences++ }
-                if (-not $target) { $impactStats[$affected].UnresolvedReferences++ }
-            }
-        }
-        foreach ($id in $impacted) {
-            if ($impactStats.ContainsKey($id)) { Write-JsonLine $writers.DependencyImpact $impactStats[$id] }
-            else { Write-JsonLine $writers.DependencyImpact ([ordered]@{ ResourceId = $id; OutboundReferences = 0; InboundReferences = 0; CrossRegionReferences = 0; UnresolvedReferences = 0 }) }
-        }
         foreach ($key in ($stats.Keys | Sort-Object)) { Write-JsonLine $writers.Summary $stats[$key] }
         if ($stats.Count -gt 0) {
             $total = 0L; $missing = 0L; $unknown = 0L
@@ -1000,13 +904,12 @@ function Invoke-RegionalInventory {
             @('Query scope', "$($preflight.ScopeType): $($preflight.ScopeLabel). Default is the current tenant, not all signed-in tenants. Explicit subscriptions are queried together."),
             @('Subscription states', $preflight.SubscriptionStateSummary),
             @('Scope', "$SourceRegion primary location, known storage/Cosmos secondary locations, and regionless children of indexed source-region ARM parents. GlobalContext is separate, not counted as impacted."),
-            @('Dependency scope', $DependencyScope),
+            @('Resource collection', 'Regional filter only: primary source region, known secondary-region fields, and global/regionless context. Resource-group metadata covers the selected scope. No all-regions resource scan.'),
             @('Visibility', 'Only Az PowerShell-visible subscriptions and ARG-indexed resources permitted by RBAC. Hidden subscriptions/resources cannot be proven absent.'),
             @('Pagination', 'One tenant-wide or explicit-subscription-array token chain per dataset; Search-AzGraph -First 1000 -SkipToken. Partial scopes are not allowed. Unique IDs and before/after counts checked; equality cannot detect all concurrent changes.'),
             @('Summary', 'Measured snapshot counts by subscription/type/impact scope. MissingTags means no tags, not missing mandatory business tags. SKU unknown includes not applicable.'),
             @('SKU', 'Service-specific units are not interchangeable. App plans are shared; do not sum app inherited workers. AKS node sizes are distinct from control-plane SKU.'),
-            @('Dependencies', 'One-hop configured ARM references, structural parents and AKS node RG membership; no runtime traffic, FQDN, connection-string, secret-value or application dependency discovery.'),
-            @('Unresolved references', 'May represent subresources, inaccessible/deleted resources, unsupported ARG types or resources outside scope; not necessarily broken dependencies.'),
+            @('Analysis limits', 'No dependency extraction, graph analysis or runtime traffic discovery. App Service plan SKU lookup and parent-region inheritance use only resources included in the regional scan.'),
             @('Global resources', 'Review GlobalContext for DNS, Front Door, Traffic Manager and other global control planes. Unreferenced global resources may still route to the region.'),
             @('Multi-region coverage', 'Explicit storage primary/secondary and Cosmos locations only. Other service replication/backup/DR placement needs service-specific validation.'),
             @('Data not collected', 'Data-plane contents/used data size, secrets, app settings, credentials, RBAC assignments, locks, policies, diagnostic settings, costs, utilization, backup coverage and runtime traffic.'),
@@ -1023,8 +926,6 @@ function Invoke-RegionalInventory {
         $sheets = @(
             @{ Name = 'Summary'; Path = $paths.Summary; Columns = @('SubscriptionName','SubscriptionId','ResourceType','ImpactScope','ResourceCount','MissingTags','SkuUnknown') },
             @{ Name = 'Inventory'; Path = $paths.Inventory; Columns = @('ResourceId','Name','ResourceType','ResourceGroup','SubscriptionId','SubscriptionName','TenantId','Region','EffectiveRegion','ImpactScope','AdditionalRegions','TargetRegion','Kind','SkuName','SkuTier','SkuCapacity','SkuBasis','SkuSourceResourceId','Zones','ProvisioningState','ResourceState','ManagedBy','IdentityType','PrincipalId','PublicNetworkAccess','TagsJson','ServiceDetailsJson','MigrationReview','TargetValidation') },
-            @{ Name = 'Dependencies'; Path = $paths.Dependencies; Columns = @('SourceId','SourceName','SourceType','SourceRegion','SourceSubscriptionId','TargetId','ResolvedTargetId','TargetName','TargetType','TargetRegion','TargetSubscriptionId','ImpactDirection','CrossRegion','CrossSubscription','Resolution','EvidencePath','EvidenceKind','Interpretation') },
-            @{ Name = 'DependencyImpact'; Path = $paths.DependencyImpact; Columns = @('ResourceId','OutboundReferences','InboundReferences','CrossRegionReferences','UnresolvedReferences') },
             @{ Name = 'GlobalContext'; Path = $paths.GlobalContext; Columns = @('ResourceId','Name','ResourceType','ResourceGroup','SubscriptionId','SubscriptionName','Region','SkuName','TagsJson','MigrationReview') },
             @{ Name = 'ResourceGroups'; Path = $paths.ResourceGroups; Columns = @('ResourceGroupId','ResourceGroup','SubscriptionId','MetadataLocation','TagsJson') },
             @{ Name = 'ScopeAudit'; Path = $paths.ScopeAudit; Columns = @('ScopeType','QueryScope','TenantId','SubscriptionIds','Dataset','ExpectedBefore','Downloaded','ExpectedAfter','Pages','Status') },
@@ -1037,7 +938,6 @@ function Invoke-RegionalInventory {
         Move-Item -LiteralPath ($workbookPath + '.partial') -Destination $workbookPath
         # Only normalized, selected metadata is staged; arbitrary ARG properties are not persisted.
         [IO.File]::Delete($paths.InventoryStaging)
-        [IO.File]::Delete($paths.ReferenceStaging)
         $manifest.Status = if ($failureCount) { 'Partial' } else { 'Completed' }
         $manifest.ScopeFailures = $failureCount
         $manifest.FinishedUtc = [DateTime]::UtcNow.ToString('o')
@@ -1045,8 +945,12 @@ function Invoke-RegionalInventory {
         $manifest.Worksheets = $sheetNames
         $manifest.IndexedResources = $index.Count
         $manifest.ImpactedResources = $impacted.Count
+        $manifest.CollectionErrors = @(Get-JsonLines $paths.Errors)
         [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json $manifest -Depth 10))
-        if ($failureCount) { throw "PARTIAL inventory saved to $workbookPath. $failureCount datasets failed for the requested query scope; review Errors and ScopeAudit." }
+        if ($failureCount) {
+            $failureDetails = ($manifest.CollectionErrors | ForEach-Object { "[$($_.Stage)] $($_.Message)" }) -join [Environment]::NewLine
+            throw "PARTIAL inventory saved to $workbookPath. $failureCount datasets failed for the requested query scope; review Errors and ScopeAudit. Original collection error(s):$([Environment]::NewLine)$failureDetails"
+        }
         Write-Host "Completed: $workbookPath ($($impacted.Count) impacted resources; $($index.Count) resources indexed)."
         [pscustomobject]@{ Workbook = $workbookPath; Manifest = $manifestPath; ImpactedResources = $impacted.Count; IndexedResources = $index.Count }
     }
