@@ -131,6 +131,57 @@ try {
         }
         Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'before=1, downloaded=1, after=2'
 
+        Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} -MaxConsistencyRetries 1 } 'OnRestart is required'
+        $testState.recoveryRows = [Collections.Generic.List[string]]::new()
+        foreach ($mode in @('DuplicateOnce','CountDriftOnce','DuplicateAlways','Authorization')) {
+            $testState.recoveryMode = $mode
+            $testState.recoveryStarts = 0
+            $testState.recoveryRestarts = 0
+            $testState.recoveryCounts = 0
+            $testState.driftServed = $false
+            $testState.recoveryRows.Clear()
+            $testState.graphHandler = {
+                param($a)
+                if ($a.Query -match 'summarize') {
+                    $testState.recoveryCounts++
+                    $count = 3
+                    if ($testState.recoveryMode -eq 'CountDriftOnce' -and $testState.recoveryStarts -eq 1 -and -not $testState.driftServed) {
+                        $count = 4
+                        $testState.driftServed = $true
+                    }
+                    return New-TestGraphPage @(@{ ResourceCount = $count })
+                }
+                if (-not $a.ContainsKey('SkipToken')) {
+                    $testState.recoveryStarts++
+                    if ($testState.recoveryMode -eq 'Authorization') { throw 'AuthorizationFailed recovery fixture' }
+                    return New-TestGraphPage @(@{ id = 'one' }, @{ id = 'two' }) 'next'
+                }
+                if ($testState.recoveryMode -eq 'DuplicateAlways' -or
+                    ($testState.recoveryMode -eq 'DuplicateOnce' -and $testState.recoveryStarts -eq 1)) {
+                    return New-TestGraphPage @(@{ id = 'two' }, @{ id = 'three' })
+                }
+                New-TestGraphPage @(@{ id = 'three' })
+            }
+            $recoveryOptions = @{
+                SubscriptionId = @($subA); BaseQuery = 'Resources'; Projection = 'id'; MaxConsistencyRetries = 2
+                OnPage = { param($rows) foreach ($row in $rows) { $testState.recoveryRows.Add($row.id) } }
+                OnRestart = { param($retry) $testState.recoveryRestarts++; $testState.recoveryRows.Clear() }
+            }
+            if ($mode -in @('DuplicateOnce','CountDriftOnce')) {
+                $recovered = Invoke-ArgPaged @recoveryOptions
+                Assert-True ($recovered.Attempts -eq 2 -and $testState.recoveryRestarts -eq 1 -and $recovered.Downloaded -eq 3) "$mode recovers with one clean retry."
+                Assert-True (($testState.recoveryRows -join ',') -eq 'one,two,three' -and $testState.recoveryCounts -eq $(if ($mode -eq 'CountDriftOnce') {4} else {3})) "$mode discards prior rows and refreshes the retry count."
+            }
+            elseif ($mode -eq 'DuplicateAlways') {
+                Assert-Throws { Invoke-ArgPaged @recoveryOptions } 'Duplicate resource ID'
+                Assert-True ($testState.recoveryStarts -eq 3 -and $testState.recoveryRestarts -eq 2 -and $testState.recoveryRows.Count -eq 2) 'Persistent duplicates stop after three attempts and retain only last-attempt rows.'
+            }
+            else {
+                Assert-Throws { Invoke-ArgPaged @recoveryOptions } 'AuthorizationFailed'
+                Assert-True ($testState.recoveryStarts -eq 1 -and $testState.recoveryRestarts -eq 0) 'Authorization failures do not trigger consistency recovery.'
+            }
+        }
+
         $index = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
         $vm = @{ id = "$prefixA/Microsoft.Compute/virtualMachines/vm"; type = 'Microsoft.Compute/virtualMachines'
             properties = @{ hardwareProfile = @{ vmSize = 'Standard_D4s_v5' } } }
@@ -259,6 +310,13 @@ try {
         $testState.simulateFailure = $false
         $testState.simulateResourceFailure = $false
         $testState.simulateResourceDuplicate = $false
+        $testState.simulateResourceDuplicateOnce = $false
+        $testState.resourceDuplicateInjected = $false
+        $testState.removeResourceOnDuplicate = $false
+        $testState.removedResourceId = ''
+        $testState.simulateGroupDuplicateOnce = $false
+        $testState.groupDuplicateInjected = $false
+        $testState.groupsPerSubscription = 1
         $testState.graphCalls = [Collections.Generic.List[object]]::new()
         $testState.graphHandler = {
             param($a)
@@ -276,8 +334,10 @@ try {
             }
             $all = @(foreach ($sub in $ids) {
                 if ($q -match '^ResourceContainers') {
-                    @{ id = "/subscriptions/$sub/resourceGroups/metadata-group"; name = 'metadata-group'
-                        subscriptionId = $sub; location = 'eastasia'; tags = @{ Owner = 'Test' } }
+                    for ($groupNumber = 0; $groupNumber -lt $testState.groupsPerSubscription; $groupNumber++) {
+                        @{ id = "/subscriptions/$sub/resourceGroups/metadata-group-$groupNumber"; name = "metadata-group-$groupNumber"
+                            subscriptionId = $sub; location = 'eastasia'; tags = @{ Owner = 'Test' } }
+                    }
                 } else { $testState.testResources[$sub] }
             })
             if ($q -match "^Resources \| where location =~ '([^']+)'") {
@@ -303,8 +363,20 @@ try {
             $last = [Math]::Min($start + $a.First, $all.Count)
             $data = @()
             if ($all.Count) { $data = @($all[$start..($last - 1)]) }
-            if ($testState.simulateResourceDuplicate -and $q -match '^Resources' -and $start -gt 0) {
+            if ($q -match '^Resources' -and $start -gt 0 -and
+                ($testState.simulateResourceDuplicate -or ($testState.simulateResourceDuplicateOnce -and -not $testState.resourceDuplicateInjected))) {
                 $data[0] = $all[0]
+                $testState.resourceDuplicateInjected = $true
+                if ($testState.removeResourceOnDuplicate) {
+                    $testState.removedResourceId = [string]$all[0].id
+                    $resourceSubscription = [string]$all[0].subscriptionId
+                    $testState.testResources[$resourceSubscription] = @($testState.testResources[$resourceSubscription] |
+                        Where-Object { $_.id -ne $testState.removedResourceId })
+                }
+            }
+            if ($q -match '^ResourceContainers' -and $start -gt 0 -and $testState.simulateGroupDuplicateOnce -and -not $testState.groupDuplicateInjected) {
+                $data[0] = $all[0]
+                $testState.groupDuplicateInjected = $true
             }
             New-TestGraphPage $data $(if ($last -lt $all.Count) { [string]$last } else { $null })
         }
@@ -588,7 +660,46 @@ try {
         Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $duplicateOut } '(?s)PARTIAL inventory saved.*\[Resources\] Duplicate resource ID while paging'
         $duplicateManifest = Get-Content (Join-Path $duplicateOut 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($duplicateManifest.Status -eq 'Partial' -and $duplicateManifest.CollectionErrors[0].Message -match 'Duplicate resource ID') 'Duplicate paging errors remain explicit in both the final exception and manifest.'
+        $duplicateAudit = @(Get-JsonLines (Join-Path $duplicateOut 'ScopeAudit.jsonl'))
+        Assert-True ($duplicateManifest.PagingConsistencyRetries -eq 2 -and $duplicateManifest.IndexedResources -eq 1000 -and
+            @($duplicateAudit | Where-Object { $_.Status -eq 'RETRY - attempt discarded' }).Count -eq 2 -and
+            @($duplicateAudit | Where-Object { $_.Dataset -eq 'Resources' -and $_.Attempt -eq 3 -and $_.Status -like 'FAILED*' }).Count -eq 1) 'Exhausted retries are bounded, audited, and preserve only the final partial attempt.'
         $testState.simulateResourceDuplicate = $false
+        $originalRecoveryResources = $testState.testResources[$subA]
+        $testState.simulateResourceDuplicateOnce = $true
+        $testState.resourceDuplicateInjected = $false
+        $testState.removeResourceOnDuplicate = $true
+        try {
+            $recoveredOut = Join-Path $TestRoot 'recovered-resources'
+            $recoveredRun = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $recoveredOut
+            $recoveredManifest = Get-Content (Join-Path $recoveredOut 'Run.json') -Raw | ConvertFrom-Json
+            $recoveredRows = @(Get-JsonLines (Join-Path $recoveredOut 'Inventory.jsonl'))
+            $recoveredAudit = @(Get-JsonLines (Join-Path $recoveredOut 'ScopeAudit.jsonl'))
+            Assert-True ($recoveredManifest.Status -eq 'Completed' -and $recoveredManifest.PagingConsistencyRetries -eq 1 -and
+                $recoveredRun.IndexedResources -eq 1005 -and $recoveredRun.ImpactedResources -eq 1004) 'A transient duplicate recovers with fresh counts and no stale index/impact entries after a resource disappears.'
+            Assert-True ($recoveredRows.Count -eq 1004 -and @($recoveredRows.ResourceId | Sort-Object -Unique).Count -eq 1004 -and
+                $testState.removedResourceId -notin $recoveredRows.ResourceId) 'Resource retry truncates prior staging and exports each current impacted resource once.'
+            Assert-True (@($recoveredAudit | Where-Object { $_.Dataset -eq 'Resources' -and $_.Attempt -eq 2 -and $_.ExpectedBefore -eq 1005 -and $_.Status -eq 'CountReconciled' }).Count -eq 1) 'Recovered resource audit records the successful attempt and refreshed expected count.'
+        }
+        finally {
+            $testState.testResources[$subA] = $originalRecoveryResources
+            $testState.simulateResourceDuplicateOnce = $false
+            $testState.removeResourceOnDuplicate = $false
+        }
+        $testState.groupsPerSubscription = 1001
+        $testState.simulateGroupDuplicateOnce = $true
+        try {
+            $groupRecoveryOut = Join-Path $TestRoot 'recovered-groups'
+            $null = Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId $subA -OutputDirectory $groupRecoveryOut
+            $groupRecoveryManifest = Get-Content (Join-Path $groupRecoveryOut 'Run.json') -Raw | ConvertFrom-Json
+            $groupRecoveryRows = @(Get-JsonLines (Join-Path $groupRecoveryOut 'ResourceGroups.jsonl'))
+            Assert-True ($groupRecoveryManifest.Status -eq 'Completed' -and $groupRecoveryManifest.PagingConsistencyRetries -eq 1) 'Resource-group paging also recovers from a transient duplicate.'
+            Assert-True ($groupRecoveryRows.Count -eq 1001 -and @($groupRecoveryRows.ResourceGroupId | Sort-Object -Unique).Count -eq 1001) 'Resource-group retry truncates previously written pages before restarting.'
+        }
+        finally {
+            $testState.groupsPerSubscription = 1
+            $testState.simulateGroupDuplicateOnce = $false
+        }
         $testState.filteredCalls = [Collections.Generic.List[object]]::new()
         $testState.graphHandler = {
             param($a)

@@ -149,39 +149,69 @@ function Invoke-ArgPaged {
         [ValidateRange(1, 1000)][int]$PageSize = 1000,
         [ValidateRange(0, [long]::MaxValue)][long]$InitialCount,
         $DefaultProfile,
-        [string]$DatasetName = 'Resources'
+        [string]$DatasetName = 'Resources',
+        [ValidateRange(0, 2)][int]$MaxConsistencyRetries = 0,
+        [scriptblock]$OnRestart
     )
-    $expected = if ($PSBoundParameters.ContainsKey('InitialCount')) { $InitialCount }
-        else { Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile }
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $tokens = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $token = $null
-    $pages = 0
+    if ($MaxConsistencyRetries -gt 0 -and $null -eq $OnRestart) {
+        throw 'OnRestart is required for consistency retries so prior attempt output can be discarded safely.'
+    }
     $scopeLabel = if ($SubscriptionId) { "Subscriptions ($($SubscriptionId.Count))" } else { 'Tenant' }
     $query = "$BaseQuery | project $Projection | order by id asc"
-    do {
-        $response = Invoke-InventoryGraph -SubscriptionId $SubscriptionId -DefaultProfile $DefaultProfile `
-            -First $PageSize -Query $query -SkipToken $token
-        if (-not $response.ContainsKey('data')) { throw "ARG response is missing data for $scopeLabel." }
-        $rows = @($response.data)
-        $pages++
-        foreach ($row in $rows) {
-            if (-not $row.id) { throw 'Every paged query must project id.' }
-            if (-not $seen.Add([string]$row.id)) {
-                throw "Duplicate resource ID while paging: $($row.id). Inventory may have changed; rerun."
+    for ($attempt = 0; ; $attempt++) {
+        $expected = if ($attempt -eq 0 -and $PSBoundParameters.ContainsKey('InitialCount')) { $InitialCount }
+            else { Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $tokens = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $token = $null
+        $pages = 0
+        $downloaded = 0L
+        Write-Host "  Starting $DatasetName paging attempt $($attempt + 1)/$($MaxConsistencyRetries + 1); expected $expected rows [$scopeLabel]"
+        try {
+            do {
+                $response = Invoke-InventoryGraph -SubscriptionId $SubscriptionId -DefaultProfile $DefaultProfile `
+                    -First $PageSize -Query $query -SkipToken $token
+                if (-not $response.ContainsKey('data')) { throw "ARG response is missing data for $scopeLabel." }
+                $rows = @($response.data)
+                $pages++
+                foreach ($row in $rows) {
+                    if (-not $row.id) { throw 'Every paged query must project id.' }
+                    if (-not $seen.Add([string]$row.id)) {
+                        $pagingError = [InvalidOperationException]::new("Duplicate resource ID while paging: $($row.id). Inventory may have changed; rerun.")
+                        $pagingError.Data['InventoryPagingConsistency'] = $true
+                        throw $pagingError
+                    }
+                }
+                if ($rows.Count -gt 0) { & $OnPage $rows }
+                $downloaded += $rows.Count
+                $token = $response['skipToken']
+                if ($token -and -not $tokens.Add([string]$token)) { throw 'ARG returned a repeated continuation token.' }
+                if ($token -and $rows.Count -eq 0) { throw 'ARG returned an empty page with a continuation token.' }
+                Write-Host "  Retrieved $DatasetName page $pages ($($rows.Count) row(s)); total so far: $downloaded/$expected [$scopeLabel]" -ForegroundColor DarkGray
+            } while ($token)
+            $after = Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile
+            if ($seen.Count -ne $expected -or $after -ne $expected) {
+                $pagingError = [InvalidOperationException]::new("ARG count mismatch for $scopeLabel : before=$expected, downloaded=$($seen.Count), after=$after. Rerun in a quieter window.")
+                $pagingError.Data['InventoryPagingConsistency'] = $true
+                throw $pagingError
             }
+            return [pscustomobject]@{ Expected = $expected; Downloaded = $downloaded; Pages = $pages; After = $after; Attempts = ($attempt + 1) }
         }
-        if ($rows.Count -gt 0) { & $OnPage $rows }
-        $token = $response['skipToken']
-        if ($token -and -not $tokens.Add([string]$token)) { throw 'ARG returned a repeated continuation token.' }
-        if ($token -and $rows.Count -eq 0) { throw 'ARG returned an empty page with a continuation token.' }
-        Write-Host "  Retrieved $DatasetName page $pages ($($rows.Count) row(s)); total so far: $($seen.Count)/$expected [$scopeLabel]" -ForegroundColor DarkGray
-    } while ($token)
-    $after = Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile
-    if ($seen.Count -ne $expected -or $after -ne $expected) {
-        throw "ARG count mismatch for $scopeLabel : before=$expected, downloaded=$($seen.Count), after=$after. Rerun in a quieter window."
+        catch {
+            $_.Exception.Data['InventoryPagingAttempt'] = $attempt + 1
+            if (-not $_.Exception.Data['InventoryPagingConsistency'] -or $attempt -ge $MaxConsistencyRetries) { throw }
+            $retry = [pscustomobject]@{
+                Attempt = $attempt + 1; Expected = $expected; Downloaded = $downloaded
+                Pages = $pages; Message = $_.Exception.Message
+            }
+            Write-Warning "$DatasetName consistency recovery $($attempt + 1)/$MaxConsistencyRetries : $($retry.Message) Discarding this attempt and restarting from page 1 with a fresh count."
+            try { & $OnRestart $retry }
+            catch {
+                throw "Unable to reset $DatasetName after paging error '$($retry.Message)'. Reset failed: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds (2 * ($attempt + 1))
+        }
     }
-    [pscustomobject]@{ Expected = $expected; Downloaded = $seen.Count; Pages = $pages; After = $after }
 }
 
 #endregion
@@ -750,12 +780,14 @@ function Invoke-RegionalInventory {
     $null = New-Item -ItemType Directory -Path $OutputDirectory
     [IO.File]::WriteAllText((Join-Path $OutputDirectory 'Preflight.json'), (ConvertTo-Json -InputObject $preflight.Checks -Depth 10))
     $manifestPath = Join-Path $OutputDirectory 'Run.json'
+    $pagingState = @{ ConsistencyRetries = 0 }
     $manifest = [ordered]@{
         Status = 'Collecting'; StartedUtc = [DateTime]::UtcNow.ToString('o'); FinishedUtc = ''
         SourceRegion = $SourceRegion; TargetRegion = $TargetRegion; ResourceScope = 'Regional'
         ScopeType = $preflight.ScopeType; TenantId = $preflight.TenantId
         SubscriptionsRequested = $preflight.SubscriptionIds; SubscriptionsDiscovered = @($accounts.id); ScopeFailures = 0
         NonEnabledSubscriptions = $preflight.NonEnabledSubscriptions
+        PagingConsistencyRetries = 0
         Note = 'Read-only ARG metadata; not a transactionally consistent snapshot or proof of migration readiness.'
     }
     [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json $manifest -Depth 10))
@@ -775,7 +807,17 @@ function Invoke-RegionalInventory {
     try {
             Write-Host "Collecting $($preflight.ScopeLabel); regional resources for $SourceRegion plus global/regionless and known secondary-region context. Resource-group metadata covers the full selected scope."
             try {
-                $rgAudit = Invoke-ArgPaged @graphOptions -DatasetName ResourceGroups -BaseQuery "ResourceContainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups'" `
+                $rgAudit = Invoke-ArgPaged @graphOptions -DatasetName ResourceGroups -MaxConsistencyRetries 2 -OnRestart {
+                        param($retry)
+                        $pagingState.ConsistencyRetries++
+                        Write-JsonLine $writers.ScopeAudit ($auditScope + @{
+                            Dataset = 'ResourceContainers'; Attempt = $retry.Attempt
+                            ExpectedBefore = $retry.Expected; Downloaded = $retry.Downloaded; Pages = $retry.Pages
+                            Status = 'RETRY - attempt discarded'; Message = $retry.Message
+                        })
+                        $writers.ResourceGroups.Dispose()
+                        $writers.ResourceGroups = New-JsonLineWriter $paths.ResourceGroups
+                    } -BaseQuery "ResourceContainers | where type =~ 'microsoft.resources/subscriptions/resourcegroups'" `
                     -Projection 'id, name, location, subscriptionId, tags' -OnPage {
                         param($rows)
                         foreach ($rg in $rows) {
@@ -788,7 +830,7 @@ function Invoke-RegionalInventory {
                 Write-JsonLine $writers.ScopeAudit ($auditScope + @{
                     Dataset = 'ResourceContainers'
                     ExpectedBefore = $rgAudit.Expected; Downloaded = $rgAudit.Downloaded; ExpectedAfter = $rgAudit.After
-                    Pages = $rgAudit.Pages; Status = 'CountReconciled'
+                    Pages = $rgAudit.Pages; Attempt = $rgAudit.Attempts; Status = 'CountReconciled'
                 })
             }
             catch {
@@ -796,13 +838,26 @@ function Invoke-RegionalInventory {
                 Write-Warning "Resource group collection incomplete: $($_.Exception.Message)"
                 Write-JsonLine $writers.Errors @{ Stage = 'ResourceContainers'; QueryScope = $preflight.ScopeLabel; Message = $_.Exception.Message }
                 Write-JsonLine $writers.ScopeAudit ($auditScope + @{
-                    Dataset = 'ResourceContainers'; Status = 'FAILED - partial rows may be present; not a complete inventory'
+                    Dataset = 'ResourceContainers'; Attempt = $_.Exception.Data['InventoryPagingAttempt']
+                    Status = 'FAILED - partial rows may be present; not a complete inventory'; Message = $_.Exception.Message
                 })
             }
             try {
                 $pagingOptions = $graphOptions.Clone()
                 $pagingOptions.InitialCount = $preflight.InitialCount
-                $audit = Invoke-ArgPaged @pagingOptions -BaseQuery $base -Projection $resourceProjection -OnPage {
+                $audit = Invoke-ArgPaged @pagingOptions -MaxConsistencyRetries 2 -OnRestart {
+                    param($retry)
+                    $pagingState.ConsistencyRetries++
+                    Write-JsonLine $writers.ScopeAudit ($auditScope + @{
+                        Dataset = 'Resources'; Attempt = $retry.Attempt
+                        ExpectedBefore = $retry.Expected; Downloaded = $retry.Downloaded; Pages = $retry.Pages
+                        Status = 'RETRY - attempt discarded'; Message = $retry.Message
+                    })
+                    $writers.InventoryStaging.Dispose()
+                    $writers.InventoryStaging = New-JsonLineWriter $paths.InventoryStaging
+                    $index.Clear()
+                    $impacted.Clear()
+                } -BaseQuery $base -Projection $resourceProjection -OnPage {
                     param($rows)
                     foreach ($r in $rows) {
                         $id = [string]$r.id
@@ -829,7 +884,7 @@ function Invoke-RegionalInventory {
                 Write-JsonLine $writers.ScopeAudit ($auditScope + @{
                     Dataset = 'Resources'
                     ExpectedBefore = $audit.Expected; Downloaded = $audit.Downloaded; ExpectedAfter = $audit.After
-                    Pages = $audit.Pages; Status = 'CountReconciled'
+                    Pages = $audit.Pages; Attempt = $audit.Attempts; Status = 'CountReconciled'
                 })
             }
             catch {
@@ -837,8 +892,8 @@ function Invoke-RegionalInventory {
                 Write-Warning "Resource collection incomplete: $($_.Exception.Message)"
                 Write-JsonLine $writers.Errors @{ Stage = 'Resources'; QueryScope = $preflight.ScopeLabel; Message = $_.Exception.Message }
                 Write-JsonLine $writers.ScopeAudit ($auditScope + @{
-                    Dataset = 'Resources'
-                    Status = 'FAILED - partial rows may be present; not a complete inventory'
+                    Dataset = 'Resources'; Attempt = $_.Exception.Data['InventoryPagingAttempt']
+                    Status = 'FAILED - partial rows may be present; not a complete inventory'; Message = $_.Exception.Message
                 })
             }
         Write-Host 'Finalizing inventory regions and service-specific SKUs ...'
@@ -907,6 +962,7 @@ function Invoke-RegionalInventory {
             @('Resource collection', 'Regional filter only: primary source region, known secondary-region fields, and global/regionless context. Resource-group metadata covers the selected scope. No all-regions resource scan.'),
             @('Visibility', 'Only Az PowerShell-visible subscriptions and ARG-indexed resources permitted by RBAC. Hidden subscriptions/resources cannot be proven absent.'),
             @('Pagination', 'One tenant-wide or explicit-subscription-array token chain per dataset; Search-AzGraph -First 1000 -SkipToken. Partial scopes are not allowed. Unique IDs and before/after counts checked; equality cannot detect all concurrent changes.'),
+            @('Paging recovery', "$($pagingState.ConsistencyRetries) discarded attempt(s). Duplicate IDs and count mismatches allow up to two clean retries per dataset with fresh counts and reset output/indexes. Review RETRY rows in ScopeAudit; exhausted recovery remains Partial."),
             @('Summary', 'Measured snapshot counts by subscription/type/impact scope. MissingTags means no tags, not missing mandatory business tags. SKU unknown includes not applicable.'),
             @('SKU', 'Service-specific units are not interchangeable. App plans are shared; do not sum app inherited workers. AKS node sizes are distinct from control-plane SKU.'),
             @('Analysis limits', 'No dependency extraction, graph analysis or runtime traffic discovery. App Service plan SKU lookup and parent-region inheritance use only resources included in the regional scan.'),
@@ -928,7 +984,7 @@ function Invoke-RegionalInventory {
             @{ Name = 'Inventory'; Path = $paths.Inventory; Columns = @('ResourceId','Name','ResourceType','ResourceGroup','SubscriptionId','SubscriptionName','TenantId','Region','EffectiveRegion','ImpactScope','AdditionalRegions','TargetRegion','Kind','SkuName','SkuTier','SkuCapacity','SkuBasis','SkuSourceResourceId','Zones','ProvisioningState','ResourceState','ManagedBy','IdentityType','PrincipalId','PublicNetworkAccess','TagsJson','ServiceDetailsJson','MigrationReview','TargetValidation') },
             @{ Name = 'GlobalContext'; Path = $paths.GlobalContext; Columns = @('ResourceId','Name','ResourceType','ResourceGroup','SubscriptionId','SubscriptionName','Region','SkuName','TagsJson','MigrationReview') },
             @{ Name = 'ResourceGroups'; Path = $paths.ResourceGroups; Columns = @('ResourceGroupId','ResourceGroup','SubscriptionId','MetadataLocation','TagsJson') },
-            @{ Name = 'ScopeAudit'; Path = $paths.ScopeAudit; Columns = @('ScopeType','QueryScope','TenantId','SubscriptionIds','Dataset','ExpectedBefore','Downloaded','ExpectedAfter','Pages','Status') },
+            @{ Name = 'ScopeAudit'; Path = $paths.ScopeAudit; Columns = @('ScopeType','QueryScope','TenantId','SubscriptionIds','Dataset','Attempt','ExpectedBefore','Downloaded','ExpectedAfter','Pages','Status','Message') },
             @{ Name = 'Coverage'; Path = $paths.Coverage; Columns = @('Topic','Notes') },
             @{ Name = 'Errors'; Path = $paths.Errors; Columns = @('Stage','QueryScope','Message') }
         )
@@ -945,10 +1001,14 @@ function Invoke-RegionalInventory {
         $manifest.Worksheets = $sheetNames
         $manifest.IndexedResources = $index.Count
         $manifest.ImpactedResources = $impacted.Count
+        $manifest.PagingConsistencyRetries = $pagingState.ConsistencyRetries
         $manifest.CollectionErrors = @(Get-JsonLines $paths.Errors)
         [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json $manifest -Depth 10))
         if ($failureCount) {
             $failureDetails = ($manifest.CollectionErrors | ForEach-Object { "[$($_.Stage)] $($_.Message)" }) -join [Environment]::NewLine
+            if ($pagingState.ConsistencyRetries) {
+                $failureDetails += "$([Environment]::NewLine)Paging consistency recovery used $($pagingState.ConsistencyRetries) retries; review attempt details in ScopeAudit."
+            }
             throw "PARTIAL inventory saved to $workbookPath. $failureCount datasets failed for the requested query scope; review Errors and ScopeAudit. Original collection error(s):$([Environment]::NewLine)$failureDetails"
         }
         Write-Host "Completed: $workbookPath ($($impacted.Count) impacted resources; $($index.Count) resources indexed)."
@@ -959,6 +1019,7 @@ function Invoke-RegionalInventory {
             $manifest.Status = 'Failed'
             $manifest.FinishedUtc = [DateTime]::UtcNow.ToString('o')
             $manifest.ScopeFailures = $failureCount
+            $manifest.PagingConsistencyRetries = $pagingState.ConsistencyRetries
             $manifest.FailureMessage = $_.Exception.Message
             [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json $manifest -Depth 10))
         }
