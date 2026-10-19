@@ -1,0 +1,7 @@
+# Generated inventories contain confidential Azure resource metadata.
+RegionalInventory-*/
+*.jsonl
+*.xlsx
+*.xlsx.partial
+Run.json
+Preflight.json
