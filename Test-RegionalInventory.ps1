@@ -2,17 +2,28 @@
 [CmdletBinding()]
 param([switch]$Scale)
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'RegionalInventory.psm1') -Force
+$entryScript = Join-Path $PSScriptRoot 'Export-AzureRegionalInventory.ps1'
+$tokens = $null
+$parseErrors = $null
+$scriptAst = [Management.Automation.Language.Parser]::ParseFile($entryScript, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors) { throw ($parseErrors | Out-String) }
+$definitions = @($scriptAst.EndBlock.Statements |
+    Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } |
+    ForEach-Object { $_.Extent.Text })
+$testModule = New-Module -Name RegionalInventoryTests -ScriptBlock ([scriptblock]::Create(
+    "Set-StrictMode -Version Latest`n" + ($definitions -join "`n")
+))
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("RegionalInventoryTests-" + [guid]::NewGuid())
 $null = New-Item -ItemType Directory -Path $testRoot
 try {
-    & (Get-Module RegionalInventory) {
-        param($TestRoot, $RunScale)
-        $script:passed = 0
+    & $testModule {
+        param($TestRoot, $RunScale, $EntryScript)
+        $testState = @{}
+        $testState.passed = 0
         function Assert-True {
             param([bool]$Condition, [string]$Message)
             if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
-            $script:passed++
+            $testState.passed++
         }
         function Assert-Throws {
             param([scriptblock]$Action, [string]$Pattern)
@@ -24,77 +35,99 @@ try {
             }
             Assert-True $caught "Expected exception: $Pattern"
         }
-        $script:realAz = ${function:Invoke-InventoryAz}
-        function Invoke-InventoryAz { param([string[]]$Arguments) & $script:azHandler $Arguments }
+        function New-TestGraphPage {
+            param([object[]]$Data = @(), [string]$SkipToken)
+            [pscustomobject]@{ Data = $Data; SkipToken = $SkipToken }
+        }
+        function Search-AzGraph {
+            [CmdletBinding()]
+            param([string]$Query, [string[]]$Subscription, [switch]$UseTenantScope, [int]$First, [string]$SkipToken, $DefaultProfile)
+            & $testState.graphHandler $PSBoundParameters
+        }
+        function Start-Sleep { param($Seconds) }
         $subA = '11111111-1111-1111-1111-111111111111'
         $subB = '22222222-2222-2222-2222-222222222222'
+        $subC = '33333333-3333-3333-3333-333333333333'
         $prefixA = "/subscriptions/$subA/resourceGroups/workload/providers"
         $prefixB = "/subscriptions/$subB/resourceGroups/shared/providers"
-        $script:pageCount = 2505
-        $script:pageCalls = [Collections.Generic.List[object]]::new()
-        $script:azHandler = {
+        $testState.pageCount = 2505
+        $testState.pageCalls = [Collections.Generic.List[object]]::new()
+        $testState.graphHandler = {
             param($a)
-            $q = $a[[array]::IndexOf($a, '-q') + 1]
-            if ($q -match 'summarize') { return @{ data = @(@{ ResourceCount = $script:pageCount }) } }
-            $script:pageCalls.Add($a)
-            $first = [int]$a[[array]::IndexOf($a, '--first') + 1]
-            $start = if ('--skip-token' -in $a) { [int]$a[[array]::IndexOf($a, '--skip-token') + 1] } else { 0 }
-            $end = [Math]::Min($start + $first, $script:pageCount)
+            if ($a.Query -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = $testState.pageCount }) }
+            $testState.pageCalls.Add(@{} + $a)
+            $first = $a.First
+            $start = if ($a.ContainsKey('SkipToken')) { [int]$a.SkipToken } else { 0 }
+            $end = [Math]::Min($start + $first, $testState.pageCount)
             $rows = @(for ($i = $start; $i -lt $end; $i++) { @{ id = "/resource/$i" } })
-            @{ data = $rows; skip_token = $(if ($end -lt $script:pageCount) { [string]$end } else { $null }) }
+            New-TestGraphPage $rows $(if ($end -lt $testState.pageCount) { [string]$end } else { $null })
         }
-        $script:received = 0L
-        $result = Invoke-ArgPaged $subA 'Resources' 'id' { param($rows) $script:received += $rows.Count }
+        $testState.received = 0L
+        $result = Invoke-ArgPaged $subA 'Resources' 'id' { param($rows) $testState.received += $rows.Count }
         Assert-True ($result.Downloaded -eq 2505 -and $result.Pages -eq 3) '2505 resources require three pages.'
-        Assert-True ($script:received -eq 2505) 'Every row reaches callback.'
-        Assert-True ($script:pageCalls[1] -contains '--skip-token') 'Second page uses continuation token.'
-        Assert-True (($script:pageCalls[0] -join ' ') -match '--first 1000') 'First is exactly 1000.'
-        $script:pageCount = 0
+        Assert-True ($testState.received -eq 2505) 'Every row reaches callback.'
+        Assert-True ($testState.pageCalls[1].SkipToken -eq '1000') 'Second page uses -SkipToken.'
+        Assert-True (-not $testState.pageCalls[0].ContainsKey('SkipToken')) 'First page omits -SkipToken.'
+        Assert-True ($testState.pageCalls[0].First -eq 1000) 'First is exactly 1000.'
+        Assert-True ($testState.pageCalls[0].Subscription[0] -eq $subA) 'Every graph call specifies subscription scope.'
+        $testState.countQueries = 0
+        $testState.originalPagingHandler = $testState.graphHandler
+        $testState.graphHandler = {
+            param($a)
+            if ($a.Query -match 'summarize') { $testState.countQueries++ }
+            & $testState.originalPagingHandler $a
+        }
+        $result = Invoke-ArgPaged $subA 'Resources' 'id' { param($rows) } -InitialCount 2505
+        Assert-True ($result.Downloaded -eq 2505 -and $testState.countQueries -eq 1) 'Preflight count reuse saves initial count call but retains final reconciliation.'
+        Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} -InitialCount 2504 } 'count mismatch'
+        $testState.graphHandler = $testState.originalPagingHandler
+        $testState.pageCount = 0
         $result = Invoke-ArgPaged $subA 'Resources' 'id' { throw 'No rows expected' }
         Assert-True ($result.Downloaded -eq 0) 'Empty scope succeeds.'
-        $script:pageCount = 2000
+        $testState.pageCount = 2000
         $result = Invoke-ArgPaged $subA 'Resources' 'id' { param($rows) }
         Assert-True ($result.Pages -eq 2) 'Exact multiple of 1000 completes without an extra page.'
         if ($RunScale) {
-            $script:pageCalls.Clear()
-            $script:pageCount = 100001
-            $result = Invoke-ArgPaged $subA 'Resources' 'id' { param($rows) }
-            Assert-True ($result.Downloaded -eq 100001 -and $result.Pages -eq 101) '100001 resources in one subscription.'
+            $testState.pageCalls.Clear()
+            $testState.pageCount = 100001
+            $result = Invoke-ArgPaged -BaseQuery 'Resources' -Projection 'id' -OnPage { param($rows) }
+            Assert-True ($result.Downloaded -eq 100001 -and $result.Pages -eq 101) '100001 tenant-wide resources in 101 pages.'
+            Assert-True (@($testState.pageCalls | Where-Object { -not $_.ContainsKey('UseTenantScope') -or $_.ContainsKey('Subscription') }).Count -eq 0) 'Every large tenant page uses UseTenantScope, not subscription scope.'
         }
-        $script:azHandler = {
+        $testState.graphHandler = {
             param($a)
-            if (($a -join ' ') -match 'summarize') { return @{ data = @(@{ ResourceCount = 2 }) } }
-            @{ data = @(@{ id = 'one' }); resultTruncated = 'true' }
+            if ($a.Query -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = 2 }) }
+            [pscustomobject]@{ Unexpected = 'no data' }
         }
-        Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'truncated'
-        $script:azHandler = {
+        Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'invalid response'
+        $testState.graphHandler = {
             param($a)
-            if (($a -join ' ') -match 'summarize') { return @{ data = @(@{ ResourceCount = 2 }) } }
-            @{ data = @(@{ id = 'one' }); skip_token = 'same' }
+            if ($a.Query -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = 2 }) }
+            New-TestGraphPage @(@{ id = 'one' }) 'same'
         }
         Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'Duplicate'
-        $script:azHandler = {
+        $testState.graphHandler = {
             param($a)
-            if (($a -join ' ') -match 'summarize') { return @{ data = @(@{ ResourceCount = 2 }) } }
-            @{ data = @(@{ id = 'one' }); skip_token = $null }
+            if ($a.Query -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = 2 }) }
+            New-TestGraphPage @(@{ id = 'one' })
         }
         Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'count mismatch'
-        $script:mockPage = 0
-        $script:azHandler = {
+        $testState.mockPage = 0
+        $testState.graphHandler = {
             param($a)
-            if (($a -join ' ') -match 'summarize') { return @{ data = @(@{ ResourceCount = 3 }) } }
-            $script:mockPage++
-            @{ data = @(@{ id = "unique-$script:mockPage" }); skip_token = 'repeated' }
+            if ($a.Query -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = 3 }) }
+            $testState.mockPage++
+            New-TestGraphPage @(@{ id = "unique-$($testState.mockPage)" }) 'repeated'
         }
         Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'repeated continuation'
-        $script:mockCounts = 0
-        $script:azHandler = {
+        $testState.mockCounts = 0
+        $testState.graphHandler = {
             param($a)
-            if (($a -join ' ') -match 'summarize') {
-                $script:mockCounts++
-                return @{ data = @(@{ ResourceCount = $script:mockCounts }) }
+            if ($a.Query -match 'summarize') {
+                $testState.mockCounts++
+                return New-TestGraphPage @(@{ ResourceCount = $testState.mockCounts })
             }
-            @{ data = @(@{ id = 'one' }) }
+            New-TestGraphPage @(@{ id = 'one' })
         }
         Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} } 'before=1, downloaded=1, after=2'
 
@@ -131,22 +164,39 @@ try {
         Assert-True ($refs.Count -eq 2) 'Only exact ARM values or identity keys; no connection string matching.'
         Assert-True ((Resolve-IndexedResource "$planId/child/one" $index).Id -eq $planId) 'Subresource ancestor resolves.'
 
-        # Exercise the real CLI retry wrapper without invoking a native Azure command.
-        $script:nativeAttempts = 0
-        function az {
-            $script:nativeAttempts++
-            if ($script:nativeAttempts -eq 1) {
-                $global:LASTEXITCODE = 1
-                # A PowerShell error stream is redirected by the wrapper just like native stderr.
-                Write-Error 'TooManyRequests 429' -ErrorAction Continue
-            }
-            else { $global:LASTEXITCODE = 0; '{"ok":true}' }
+        $testState.graphAttempts = 0
+        $testState.graphHandler = {
+            param($a)
+            $testState.graphAttempts++
+            if ($testState.graphAttempts -eq 1) { throw 'TooManyRequests 429' }
+            New-TestGraphPage @(@{ ok = $true })
         }
-        function Start-Sleep { param($Seconds) }
-        $retry = & $script:realAz -Arguments @('mock') -MaxRetries 1
-        Assert-True ($retry.ok -and $script:nativeAttempts -eq 2) 'Throttle is retried.'
-        function az { $global:LASTEXITCODE = 1; Write-Error 'AuthorizationFailed' -ErrorAction Continue }
-        Assert-Throws { & $script:realAz -Arguments @('mock') } 'AuthorizationFailed'
+        $retry = Invoke-InventoryGraph -Query 'Resources' -SubscriptionId $subA -MaxRetries 1
+        Assert-True ($retry.data[0].ok -and $testState.graphAttempts -eq 2) 'Throttle is retried.'
+        $testState.graphAttempts = 0
+        $testState.graphHandler = { param($a) $testState.graphAttempts++; throw 'AuthorizationFailed' }
+        Assert-Throws { Invoke-InventoryGraph -Query 'Resources' -SubscriptionId $subA } 'AuthorizationFailed'
+        Assert-True ($testState.graphAttempts -eq 1) 'Authorization errors are not retried.'
+        $testState.graphHandler = { param($a) New-TestGraphPage @() 'next-page' }
+        Assert-Throws { Invoke-ArgPaged $subA 'Resources' 'id' {} -InitialCount 1 } 'empty page with a continuation token'
+        if (Get-Module -ListAvailable Az.ResourceGraph) {
+            Import-Module Az.ResourceGraph -Verbose:$false
+            $nativeCommand = Get-Command Search-AzGraph -CommandType Cmdlet
+            $responseType = $nativeCommand.ImplementingType.Assembly.GetExportedTypes() |
+                Where-Object Name -eq 'PSResourceGraphResponse`1'
+            $testState.nativePage = [Activator]::CreateInstance($responseType.MakeGenericType([psobject]))
+            $testState.nativePage.Data = [Collections.Generic.List[psobject]]::new()
+            $testState.nativePage.Data.Add([pscustomobject]@{ id = 'typed'; properties = @{ hardwareProfile = @{ vmSize = 'Standard_D2s_v5' } } })
+            $testState.nativePage.SkipToken = 'native-token'
+            $testState.graphHandler = { param($a) Write-Output -NoEnumerate $testState.nativePage }
+            $normalized = Invoke-InventoryGraph -Query 'Resources' -SubscriptionId $subA
+            Assert-True ($normalized.skipToken -eq 'native-token') 'Native PSResourceGraphResponse retains continuation metadata.'
+            Assert-True ($normalized.data[0].properties.hardwareProfile.vmSize -eq 'Standard_D2s_v5') 'Native nested PSObject metadata normalizes to dictionaries.'
+            $testState.nativePage.Data.Clear()
+            $testState.nativePage.SkipToken = $null
+            $normalized = Invoke-InventoryGraph -Query 'Resources' -SubscriptionId $subA
+            Assert-True ($normalized.data.Count -eq 0) 'Native empty response retains its wrapper instead of becoming null.'
+        }
 
         # Full offline orchestration: >1000 resources, late cross-subscription plan, inbound reference and secondary region.
         function New-TestResource {
@@ -174,78 +224,139 @@ try {
             New-TestResource $planId 'microsoft.web/serverfarms' 'eastasia' @{} @{ name = 'P1v3'; tier = 'PremiumV3'; capacity = 3 }
             New-TestResource "$prefixB/Microsoft.Example/consumers/consumer" 'microsoft.example/consumers' 'eastasia' @{ upstreamId = $appId }
         )
-        $script:testResources = @{ $subA = @($resourcesA.ToArray()); $subB = $resourcesB }
-        $script:simulateFailure = $false
-        $script:azHandler = {
+        $testState.testResources = @{ $subA = @($resourcesA.ToArray()); $subB = $resourcesB }
+        $testState.simulateFailure = $false
+        $testState.simulateResourceFailure = $false
+        $testState.graphCalls = [Collections.Generic.List[object]]::new()
+        $testState.graphHandler = {
             param($a)
-            if ($a[0] -eq 'version') { return @{ 'azure-cli' = '2.80.0' } }
-            switch ("$($a[0]) $($a[1])") {
-                'account show' { return @{ id = $subA } }
-                'extension list' { return @(@{ name = 'resource-graph' }) }
-                'account list' { return @(
-                    @{ id = $subA; name = 'Workloads'; tenantId = 'tenant'; state = 'Enabled' }
-                    @{ id = $subB; name = 'Shared'; tenantId = 'tenant'; state = 'Enabled' }
-                ) }
-                'account list-locations' { return @(@{ name = 'southeastasia' }, @{ name = 'eastasia' }) }
-                'graph query' {
-                    $sub = $a[[array]::IndexOf($a, '--subscriptions') + 1]
-                    $q = $a[[array]::IndexOf($a, '-q') + 1]
-                    if ($script:simulateFailure -and $sub -eq $subB -and $q -match '^ResourceContainers') { throw 'AuthorizationFailed test fixture' }
-                    $all = @(if ($q -match '^ResourceContainers') {
-                        @{ id = "/subscriptions/$sub/resourceGroups/metadata-group"; name = 'metadata-group'
-                            subscriptionId = $sub; location = 'eastasia'; tags = @{ Owner = 'Test' } }
-                    } else { $script:testResources[$sub] })
-                    if ($q -match 'summarize') { return @{ data = @(@{ ResourceCount = $all.Count }) } }
-                    $start = if ('--skip-token' -in $a) { [int]$a[[array]::IndexOf($a, '--skip-token') + 1] } else { 0 }
-                    $last = [Math]::Min($start + 1000, $all.Count)
-                    $data = @()
-                    if ($all.Count) { $data = @($all[$start..($last - 1)]) }
-                    return @{ data = $data; skip_token = $(if ($last -lt $all.Count) { [string]$last } else { $null }) }
-                }
-                default { throw "Unexpected mock CLI call: $($a -join ' ')" }
+            $testState.graphCalls.Add(@{} + $a)
+            $q = $a.Query
+            if ($a.DefaultProfile.Tenant.Id -ne 'tenant-a') { throw 'Context tenant does not match query scope' }
+            if ($a.ContainsKey('Subscription') -and $a.ContainsKey('UseTenantScope')) { throw 'Mutually exclusive graph scopes supplied' }
+            $ids = if ($a.ContainsKey('UseTenantScope')) { @($subA, $subB) } else { @($a.Subscription) }
+            if ($testState.simulateFailure -and $q -match '^ResourceContainers') { throw 'AuthorizationFailed test fixture' }
+            if ($testState.simulateResourceFailure -and $q -match '^Resources' -and $a.ContainsKey('SkipToken')) {
+                throw 'AuthorizationFailed on continuation test fixture'
+            }
+            $all = @(foreach ($sub in $ids) {
+                if ($q -match '^ResourceContainers') {
+                    @{ id = "/subscriptions/$sub/resourceGroups/metadata-group"; name = 'metadata-group'
+                        subscriptionId = $sub; location = 'eastasia'; tags = @{ Owner = 'Test' } }
+                } else { $testState.testResources[$sub] }
+            })
+            $all = @($all | Sort-Object id)
+            if ($q -match 'summarize') { return New-TestGraphPage @(@{ ResourceCount = $all.Count }) }
+            $start = if ($a.ContainsKey('SkipToken')) { [int]$a.SkipToken } else { 0 }
+            $last = [Math]::Min($start + $a.First, $all.Count)
+            $data = @()
+            if ($all.Count) { $data = @($all[$start..($last - 1)]) }
+            New-TestGraphPage $data $(if ($last -lt $all.Count) { [string]$last } else { $null })
+        }
+        $testState.completeHandler = $testState.graphHandler
+        $testState.preflightScenario = ''
+        $testState.originalContext = [pscustomobject]@{ Account = 'test-account'; Subscription = @{ Id = 'original-subscription' }; Tenant = @{ Id = 'tenant-a' } }
+        $testState.currentContext = $testState.originalContext
+        $testState.subscriptionCalls = [Collections.Generic.List[object]]::new()
+        $testState.loginOptions = $null
+        function Import-InventoryAzModules {
+            if ($testState.preflightScenario -eq 'MissingModule') { throw 'Required module Az.ResourceGraph is missing. Install-Module Az.ResourceGraph -Scope CurrentUser' }
+            if ($testState.preflightScenario -eq 'OldModule') { throw 'Search-AzGraph is missing -SkipToken. Update the owning Az module' }
+            foreach ($name in @('Az.Accounts','Az.ResourceGraph','Az.Resources')) {
+                [pscustomobject]@{ Name = $name; Version = '1.0-test' }
             }
         }
-        $script:completeHandler = $script:azHandler
+        function Get-AzContext {
+            [CmdletBinding()]param()
+            if ($testState.preflightScenario -eq 'LoggedOut') { return $null }
+            $testState.currentContext
+        }
+        function Connect-AzAccount {
+            [CmdletBinding()]param($Scope, $Tenant, [switch]$UseDeviceAuthentication)
+            $testState.loginOptions = @{} + $PSBoundParameters
+        }
+        function Get-AzSubscription {
+            [CmdletBinding()]param($DefaultProfile, $SubscriptionId, $TenantId)
+            $testState.subscriptionCalls.Add(@{} + $PSBoundParameters)
+            @(
+                [pscustomobject]@{ Id = $subB; Name = 'Shared'; TenantId = 'tenant-a'; State = $(if ($testState.preflightScenario -eq 'Disabled') {'Disabled'} else {'Enabled'}) }
+                [pscustomobject]@{ Id = $subA; Name = 'Workloads'; TenantId = 'tenant-a'; State = 'Enabled' }
+                [pscustomobject]@{ Id = $subC; Name = 'Other tenant'; TenantId = 'tenant-b'; State = 'Enabled' }
+            ) | Where-Object { (-not $SubscriptionId -or $_.Id -eq $SubscriptionId) -and (-not $TenantId -or $_.TenantId -eq $TenantId) }
+        }
+        function Set-AzContext {
+            [CmdletBinding()]param($Subscription, $Tenant, $Context, $Scope)
+            if ($Scope -ne 'Process') { throw 'Context changes must be process-scoped.' }
+            if ($Context) { $testState.currentContext = $Context }
+            else { $testState.currentContext = [pscustomobject]@{ Account = 'test-account'; Subscription = @{ Id = $Subscription }; Tenant = @{ Id = $Tenant } } }
+            $testState.currentContext
+        }
+        function Get-AzLocation {
+            [CmdletBinding()]param($DefaultProfile)
+            [pscustomobject]@{ Location = 'southeastasia' }
+            [pscustomobject]@{ Location = 'eastasia' }
+        }
         $checkPath = Join-Path $TestRoot 'preflight-only'
         $checks = @(Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $checkPath -CheckOnly)
-        Assert-True ($checks.Count -eq 9) 'CheckOnly returns runtime, CLI, extension, scope, per-subscription live access, regions and path checks.'
+        Assert-True ($checks.Count -eq 7) 'CheckOnly validates runtime, Az modules, tenant scope, one live query, regions and path.'
+        Assert-True ($testState.currentContext -eq $testState.originalContext) 'Preflight restores original Az context.'
         Assert-True (-not (Test-Path $checkPath)) 'CheckOnly does not create the output directory.'
         Assert-True (@(Get-ChildItem -LiteralPath $TestRoot -Filter '.inventory-preflight-*').Count -eq 0) 'Write probe is cleaned up.'
+        $testState.originalContext.Tenant.Id = 'tenant-b'
+        try {
+            $null = Invoke-RegionalInventory -SourceRegion southeastasia -TenantId 'tenant-a' -OutputDirectory $checkPath -CheckOnly
+            Assert-True ($testState.subscriptionCalls[-1].TenantId -eq 'tenant-a' -and $testState.graphCalls[-1].DefaultProfile.Tenant.Id -eq 'tenant-a') 'Explicit TenantId overrides the current tenant for discovery and ARG.'
+            Assert-True ($testState.currentContext.Tenant.Id -eq 'tenant-b') 'Explicit tenant preflight restores the original other-tenant context.'
+        }
+        finally { $testState.originalContext.Tenant.Id = 'tenant-a' }
+        $testState.subscriptionCalls.Clear()
+        $testState.graphCalls.Clear()
+        $null = Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId $subA -OutputDirectory $checkPath -CheckOnly
+        Assert-True ($testState.subscriptionCalls.Count -eq 1 -and $testState.subscriptionCalls[0].TenantId -eq 'tenant-a') 'Subscription metadata is discovered once for the current tenant.'
+        Assert-True ($testState.graphCalls.Count -eq 1) 'Explicit scope still verifies live ARG access.'
+        Assert-True ($testState.graphCalls[0].Subscription[0] -eq $subA -and -not $testState.graphCalls[0].ContainsKey('UseTenantScope')) 'Explicit scope is forwarded without tenant expansion.'
+        $testState.graphCalls.Clear()
+        $null = Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId @($subA,$subB,$subA) -OutputDirectory $checkPath -CheckOnly
+        Assert-True ($testState.graphCalls.Count -eq 1 -and $testState.graphCalls[0].Subscription.Count -eq 2) 'Subscription array is deduplicated and queried together in one preflight count.'
+        $null = Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId $subA -OutputDirectory $checkPath -CheckOnly -Login -UseDeviceCode -TenantId 'tenant-a'
+        Assert-True ($testState.loginOptions.UseDeviceAuthentication -and $testState.loginOptions.Scope -eq 'Process' -and $testState.loginOptions.Tenant -eq 'tenant-a') 'Login maps to process-scoped Az device authentication.'
         Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $checkPath -CheckOnly -UseDeviceCode } 'requires Login'
         Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $TestRoot -CheckOnly } 'already exists'
         Assert-Throws { Invoke-RegionalInventory -SourceRegion invalidregion -OutputDirectory $checkPath -CheckOnly } 'Unknown source region'
         Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -TargetRegion southeastasia -OutputDirectory $checkPath -CheckOnly } 'must be different'
-        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId 'not-visible' -OutputDirectory $checkPath -CheckOnly } 'not in CLI account list'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId 'not-visible' -OutputDirectory $checkPath -CheckOnly } 'not visible'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId @($subA,$subC) -OutputDirectory $checkPath -CheckOnly } 'Cross-tenant arrays'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId @() -OutputDirectory $checkPath -CheckOnly } 'empty'
         Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -TenantId 'another-tenant' -OutputDirectory $checkPath -CheckOnly } 'No subscriptions'
-        $script:preflightScenario = ''
-        $script:azHandler = {
+        $testState.preflightScenario = ''
+        $testState.graphHandler = {
             param($a)
-            if ($a[0] -eq 'version' -and $script:preflightScenario -eq 'OldCli') { return @{ 'azure-cli' = '2.21.0' } }
-            if ($a[0] -eq 'version' -and $script:preflightScenario -eq 'InvalidCli') { return @{ 'azure-cli' = 'invalid' } }
-            if ($a[0] -eq 'extension' -and $script:preflightScenario -eq 'MissingExtension') { return @() }
-            if ($a[0] -eq 'account' -and $a[1] -eq 'show' -and $script:preflightScenario -eq 'LoggedOut') { throw 'Please run az login' }
-            if ($a[0] -eq 'graph' -and $script:preflightScenario -eq 'ExpiredToken') { throw 'AADSTS token expired' }
-            if ($a[0] -eq 'account' -and $a[1] -eq 'list' -and $script:preflightScenario -eq 'Disabled') {
-                return @{ id = $subA; name = 'Disabled'; tenantId = 'tenant'; state = 'Disabled' }
-            }
-            & $script:completeHandler $a
+            if ($testState.preflightScenario -eq 'ExpiredToken') { throw 'AADSTS token expired' }
+            & $testState.completeHandler $a
         }
         foreach ($case in @(
-            @('OldCli', '2.22.0'), @('InvalidCli', '2.22.0'),
-            @('MissingExtension', 'az extension add'), @('LoggedOut', 'az login'),
+            @('OldModule', 'Update the owning Az module'),
+            @('MissingModule', 'Install-Module'), @('LoggedOut', 'Connect-AzAccount'),
             @('ExpiredToken', 'Live ARG preflight failed'), @('Disabled', 'not Enabled')
         )) {
-            $script:preflightScenario = $case[0]
+            $testState.preflightScenario = $case[0]
             Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $checkPath -CheckOnly } $case[1]
             Assert-True (-not (Test-Path $checkPath)) "Preflight failure $($case[0]) stops before output collection."
+            Assert-True ($testState.currentContext -eq $testState.originalContext) "Context restored after $($case[0]) failure."
         }
-        $script:azHandler = $script:completeHandler
+        $testState.preflightScenario = ''
+        $testState.graphHandler = $testState.completeHandler
         $out = Join-Path $TestRoot 'complete'
+        $testState.graphCalls.Clear()
         $run = Invoke-RegionalInventory -SourceRegion southeastasia -TargetRegion eastasia -OutputDirectory $out -RowsPerSheet 1000
+        Assert-True ($testState.graphCalls.Count -eq 7) 'Two-subscription tenant run uses only seven graph count/page calls.'
+        Assert-True (@($testState.graphCalls | Where-Object { -not $_.ContainsKey('UseTenantScope') -or $_.ContainsKey('Subscription') }).Count -eq 0) 'Every default graph query uses tenant scope.'
+        Assert-True (@($testState.graphCalls | Where-Object { $_.Query -notmatch 'summarize' -and $_.Query -match '^Resources' }).Count -eq 2) 'One resource token chain covers resources across two subscriptions.'
         Assert-True ($run.ImpactedResources -eq 1004 -and $run.IndexedResources -eq 1007) 'Full run selects primary, secondary and inherited resources, not every region.'
         $inventory = @(Get-JsonLines (Join-Path $out 'Inventory.jsonl'))
         $appRow = @($inventory | Where-Object { $_.ResourceId -eq $appId })[0]
         Assert-True ($appRow.SkuName -eq 'P1v3') 'Late plan resolution updates final app inventory.'
+        Assert-True ($appRow.SubscriptionId -eq $subA -and $appRow.SubscriptionName -eq 'Workloads') 'Mixed-scope rows use their own subscription metadata, not the query context default subscription.'
         Assert-True (@(Get-JsonLines (Join-Path $out 'ResourceGroups.jsonl')).Count -eq 2) 'Resource-group dataset collected independently of workload region.'
         $slotRow = @($inventory | Where-Object { $_.ResourceType -eq 'microsoft.web/sites/slots' })[0]
         Assert-True ($slotRow.ImpactScope -eq 'InheritedParentRegion' -and $slotRow.EffectiveRegion -eq 'southeastasia') 'Regionless child inherits indexed parent region.'
@@ -255,7 +366,18 @@ try {
         Assert-True (-not (Test-Path (Join-Path $out 'InventoryStaging.jsonl'))) 'Staging cleaned after success.'
         $manifest = Get-Content (Join-Path $out 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($manifest.Status -eq 'Completed') 'Successful manifest.'
+        Assert-True ($manifest.ScopeType -eq 'Tenant' -and $manifest.TenantId -eq 'tenant-a' -and $manifest.SubscriptionsRequested.Count -eq 0) 'Default manifest records tenant scope without an implicit explicit subscription list.'
+        $audits = @(Get-JsonLines (Join-Path $out 'ScopeAudit.jsonl'))
+        Assert-True ($audits.Count -eq 2 -and @($audits | Where-Object { $_.ScopeType -ne 'Tenant' -or $_.Status -ne 'CountReconciled' }).Count -eq 0) 'Audit has one aggregate row per dataset rather than per subscription.'
+        Assert-True (@($audits | Where-Object { $_.Dataset -eq 'Resources' -and $_.Downloaded -eq 1007 -and $_.Pages -eq 2 }).Count -eq 1) 'Aggregate resource audit has exact count and page total.'
         Assert-True (Test-Path (Join-Path $out 'Preflight.json')) 'Successful preflight checks saved alongside inventory.'
+        $arrayOut = Join-Path $TestRoot 'array-scope'
+        $testState.graphCalls.Clear()
+        $arrayRun = Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId @($subA,$subB) -OutputDirectory $arrayOut
+        Assert-True ($arrayRun.IndexedResources -eq 1007 -and $testState.graphCalls.Count -eq 7) 'Explicit array collects both subscriptions through one aggregate token chain.'
+        Assert-True (@($testState.graphCalls | Where-Object { $_.ContainsKey('UseTenantScope') -or $_.Subscription.Count -ne 2 }).Count -eq 0) 'Every explicit-array query retains the same full array without tenant expansion.'
+        $arrayManifest = Get-Content (Join-Path $arrayOut 'Run.json') -Raw | ConvertFrom-Json
+        Assert-True ($arrayManifest.ScopeType -eq 'Subscriptions' -and $arrayManifest.SubscriptionsRequested.Count -eq 2) 'Explicit-array scope is persisted accurately.'
 
         $zip = [IO.Compression.ZipFile]::OpenRead($run.Workbook)
         try {
@@ -313,13 +435,60 @@ try {
             Assert-True ($x.worksheet.sheetData.row[3].c.is.t.InnerText.Length -le 32767) 'Unicode truncation preserves surrogate pairs.'
         }
         finally { $zip.Dispose() }
-        $script:simulateFailure = $true
+        $testState.simulateFailure = $true
         $partialOut = Join-Path $TestRoot 'partial'
         Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $partialOut } 'PARTIAL inventory saved'
         $partial = Get-Content (Join-Path $partialOut 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($partial.Status -eq 'Partial' -and (Test-Path (Join-Path $partialOut 'RegionalInventory.xlsx'))) 'Partial workbook preserved with explicit failure status.'
-        Write-Host "PASS: $script:passed assertions. No Azure connection was made."
-    } $testRoot ([bool]$Scale)
+        Assert-True ($partial.ScopeFailures -eq 1 -and $partial.IndexedResources -eq 1007) 'A failed group dataset does not prevent resource inventory collection.'
+        $testState.simulateFailure = $false
+        $testState.simulateResourceFailure = $true
+        $resourcePartialOut = Join-Path $TestRoot 'resource-partial'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $resourcePartialOut } 'PARTIAL inventory saved'
+        $resourcePartial = Get-Content (Join-Path $resourcePartialOut 'Run.json') -Raw | ConvertFrom-Json
+        Assert-True ($resourcePartial.Status -eq 'Partial' -and $resourcePartial.IndexedResources -eq 1000) 'Continuation failure preserves partial rows without claiming success.'
+        $testState.simulateResourceFailure = $false
+        $testState.filteredCalls = [Collections.Generic.List[object]]::new()
+        $testState.graphHandler = {
+            param($a)
+            $testState.filteredCalls.Add($a)
+            & $testState.completeHandler $a
+        }
+        $filteredOut = Join-Path $TestRoot 'filtered'
+        $null = Invoke-RegionalInventory -SourceRegion southeastasia -DependencyScope SourceRegionOnly -OutputDirectory $filteredOut
+        Assert-True (@($testState.filteredCalls | Where-Object {
+            $_.Query -match '^Resources \| where .*summarize'
+        }).Count -eq 2) 'Filtered tenant scope runs one initial and one final filtered count, not per-subscription counts.'
+        # Execute the actual entry point from a folder containing only the collector.
+        $standaloneFolder = Join-Path $TestRoot 'standalone'
+        $null = New-Item -ItemType Directory -Path $standaloneFolder
+        $standaloneScript = Join-Path $standaloneFolder 'Export-AzureRegionalInventory.ps1'
+        Copy-Item -LiteralPath $EntryScript -Destination $standaloneScript
+        $testState.graphHandler = $testState.completeHandler
+        $standaloneOutput = Join-Path $TestRoot 'standalone-output'
+        & {
+            # Supply only module availability metadata; all Azure calls remain mocked.
+            function Get-Module {
+                [CmdletBinding()]param([string[]]$Name, [switch]$ListAvailable)
+                foreach ($moduleName in $Name) {
+                    if ($moduleName -notin @('Az.Accounts','Az.ResourceGraph','Az.Resources')) {
+                        throw "Unexpected module request in standalone test: $moduleName"
+                    }
+                    [pscustomobject]@{ Name = $moduleName; Version = [version]'1.0.0' }
+                }
+            }
+            $checks = @(& $standaloneScript -SourceRegion southeastasia -SubscriptionId $subA -CheckOnly -OutputDirectory $standaloneOutput)
+            Assert-True ($checks.Count -eq 7) 'Standalone script executes preflight without a companion module.'
+            Assert-True (-not (Test-Path $standaloneOutput)) 'Standalone CheckOnly does not create inventory files.'
+            $standaloneRun = & $standaloneScript -SourceRegion southeastasia -TargetRegion eastasia -SubscriptionId $subA `
+                -OutputDirectory $standaloneOutput -RowsPerSheet 1000
+            Assert-True ($standaloneRun.IndexedResources -eq 1005 -and $standaloneRun.ImpactedResources -eq 1004) 'Standalone entry point forwards parameters and collects all pages.'
+            Assert-True (Test-Path -LiteralPath $standaloneRun.Workbook) 'Standalone entry point writes the workbook.'
+            Assert-True ($testState.currentContext -eq $testState.originalContext) 'Standalone execution preserves original Az context.'
+        }
+        Assert-True (@(Get-ChildItem -LiteralPath $standaloneFolder -File).Count -eq 1) 'Collector distribution consists of one script.'
+        Write-Host "PASS: $($testState.passed) assertions. No Azure connection was made."
+    } $testRoot ([bool]$Scale) $entryScript
 }
 finally {
     # Delete only this test's explicitly created, GUID-named temporary directory.
