@@ -283,7 +283,8 @@ function Get-ServiceProfile {
             $details.KubernetesVersion = Get-Field $p 'kubernetesVersion'
             $details.NodeResourceGroup = Get-Field $p 'nodeResourceGroup'
             $details.NetworkPlugin = Get-Field $p 'networkProfile.networkPlugin'
-            $details.NodePools = @(foreach ($pool in @(Get-Field $p 'agentPoolProfiles')) {
+            $nodePools = Get-Field $p 'agentPoolProfiles'
+            $details.NodePools = @(foreach ($pool in $nodePools) {
                 if ($pool) {
                     [ordered]@{ Name = $pool['name']; VMSize = $pool['vmSize']; Count = $pool['count']
                         Min = $pool['minCount']; Max = $pool['maxCount']; Zones = $pool['availabilityZones']
@@ -421,7 +422,8 @@ function ConvertTo-InventoryRow {
         $location = [string](Get-Field $p $path)
         if ($location) { [void]$secondary.Add($location.Replace(' ', '').ToLowerInvariant()) }
     }
-    foreach ($location in @(Get-Field $p 'locations')) {
+    $locations = Get-Field $p 'locations'
+    foreach ($location in $locations) {
         $name = [string](Get-Field $location 'locationName')
         if ($name) { [void]$secondary.Add($name.Replace(' ', '').ToLowerInvariant()) }
     }

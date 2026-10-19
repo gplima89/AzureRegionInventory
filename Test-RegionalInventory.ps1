@@ -145,6 +145,28 @@ try {
             properties = @{ virtualMachineProfile = @{ storageProfile = @{ osDisk = @{ osType = 'Linux' } } } } }
         $vmssSku = Get-ServiceProfile $vmss $index
         Assert-True ($vmssSku.Details -match 'Linux' -and $vmssSku.Capacity -eq 4) 'VMSS details use virtualMachineProfile.'
+        $pools = @(
+            @{ name = 'system'; vmSize = 'Standard_D2s_v5'; count = 3; mode = 'System'; availabilityZones = @('1','2'); vnetSubnetID = "$prefixA/Microsoft.Network/virtualNetworks/vnet/subnets/system" }
+            @{ name = 'workers'; vmSize = 'Standard_D4s_v5'; count = 5; mode = 'User'; minCount = 2; maxCount = 8 }
+        )
+        $aks = @{ id = "$prefixA/Microsoft.ContainerService/managedClusters/cluster"; type = 'microsoft.containerservice/managedclusters'
+            properties = @{ kubernetesVersion = '1.33'; agentPoolProfiles = @() } }
+        foreach ($poolCount in @(0,1,2)) {
+            $aks.properties.agentPoolProfiles = @($pools | Select-Object -First $poolCount)
+            $aksProfile = Get-ServiceProfile $aks $index
+            $aksDetails = ConvertFrom-Json -InputObject $aksProfile.Details -AsHashtable
+            Assert-True ($aksDetails.NodePools.Count -eq $poolCount) "AKS exports exactly $poolCount node pools without nesting the source array."
+            if ($poolCount) {
+                Assert-True ($aksDetails.NodePools[0].Name -eq 'system' -and $aksDetails.NodePools[0].VMSize -eq 'Standard_D2s_v5' -and $aksDetails.NodePools[0].Count -eq 3) 'AKS node-pool name, VM size and count retain their scalar values.'
+                Assert-True ($aksDetails.NodePools[0].Zones.Count -eq 2) 'AKS node-pool zone arrays remain intact.'
+            }
+            if ($poolCount -eq 2) {
+                Assert-True ($aksDetails.NodePools[1].Name -eq 'workers' -and $aksDetails.NodePools[1].Max -eq 8) 'AKS exports every node pool with autoscaling metadata.'
+            }
+        }
+        $aks.properties.Remove('agentPoolProfiles')
+        $aksProfile = Get-ServiceProfile $aks $index
+        Assert-True ((ConvertFrom-Json -InputObject $aksProfile.Details -AsHashtable).NodePools.Count -eq 0) 'AKS tolerates absent node-pool metadata.'
         $planId = "$prefixB/Microsoft.Web/serverfarms/plan"
         $index[$planId] = [pscustomobject]@{ Id = $planId; SkuName = 'P1v3'; SkuTier = 'PremiumV3'; SkuCapacity = 3; Location = 'eastasia' }
         $app = @{ id = "$prefixA/Microsoft.Web/sites/app"; type = 'microsoft.web/sites'; properties = @{ serverFarmId = $planId } }
@@ -156,6 +178,17 @@ try {
         $serviceProfile = Get-ServiceProfile $storage $index
         $row = ConvertTo-InventoryRow $storage @{ name = 'A'; tenantId = 'tenant' } $serviceProfile 'southeastasia' 'eastasia'
         Assert-True ($row.ImpactScope -eq 'SecondaryRegion' -and $row.SkuName -eq 'Standard_GRS') 'Secondary-region storage is impacted.'
+        $cosmos = @{ id = "$prefixA/Microsoft.DocumentDB/databaseAccounts/cosmos"; name = 'cosmos'; type = 'microsoft.documentdb/databaseaccounts'
+            resourceGroup = 'workload'; subscriptionId = $subA; location = 'eastasia'
+            properties = @{ locations = @(@{ locationName = 'East Asia' }, @{ locationName = 'Southeast Asia' }) } }
+        foreach ($locationCount in @(1,2)) {
+            $cosmos.properties.locations = @(@{ locationName = 'East Asia' })
+            if ($locationCount -eq 2) { $cosmos.properties.locations += @{ locationName = 'Southeast Asia' } }
+            $cosmosProfile = Get-ServiceProfile $cosmos $index
+            $cosmosRow = ConvertTo-InventoryRow $cosmos @{ name = 'A'; tenantId = 'tenant' } $cosmosProfile 'southeastasia' 'eastasia'
+            Assert-True (($cosmosRow.AdditionalRegions -split ';').Count -eq $locationCount -and ($cosmosRow.AdditionalRegions -split ';') -contains 'eastasia') "Cosmos iterates $locationCount region entries rather than the array wrapper."
+            Assert-True ($cosmosRow.ImpactScope -eq $(if ($locationCount -eq 2) {'SecondaryRegion'} else {'GlobalContext'})) 'Cosmos secondary-region impact follows the individual location entries.'
+        }
         $refs = @(Get-ArmReferences -Value @{
             subnet = @{ id = "$prefixA/Microsoft.Network/virtualNetworks/vnet/subnets/default" }
             credential = "Password=secret;Resource=$planId"
@@ -402,6 +435,23 @@ try {
         $stateCoverage = @(Get-JsonLines (Join-Path $stateOut 'Coverage.jsonl'))
         Assert-True (@($stateCoverage | Where-Object { $_.Topic -eq 'Subscription states' -and $_.Notes -match $subB -and $_.Notes -match 'not proof of complete inventory' }).Count -eq 1) 'Workbook coverage records the subscription-state visibility caveat.'
         $testState.preflightScenario = ''
+        $originalResources = $testState.testResources[$subA]
+        try {
+            $aksId = "$prefixA/Microsoft.ContainerService/managedClusters/cluster"
+            $testState.testResources[$subA] += @(
+                New-TestResource $aksId 'microsoft.containerservice/managedclusters' 'southeastasia' @{ agentPoolProfiles = $pools }
+                New-TestResource $cosmos.id 'microsoft.documentdb/databaseaccounts' 'eastasia' $cosmos.properties
+            )
+            $arrayMetadataOut = Join-Path $TestRoot 'array-metadata'
+            $arrayMetadataRun = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $arrayMetadataOut
+            $arrayMetadataManifest = Get-Content (Join-Path $arrayMetadataOut 'Run.json') -Raw | ConvertFrom-Json
+            $arrayMetadataInventory = @(Get-JsonLines (Join-Path $arrayMetadataOut 'Inventory.jsonl'))
+            Assert-True ($arrayMetadataManifest.Status -eq 'Completed' -and $arrayMetadataRun.IndexedResources -eq 1009 -and $arrayMetadataRun.ImpactedResources -eq 1006) 'AKS and Cosmos array metadata complete a full paged run without partial inventory.'
+            $aksRow = @($arrayMetadataInventory | Where-Object { $_.ResourceId -eq $aksId })[0]
+            Assert-True ((ConvertFrom-Json -InputObject $aksRow.ServiceDetailsJson -AsHashtable).NodePools.Count -eq 2) 'Final inventory retains both AKS node pools.'
+            Assert-True (@($arrayMetadataInventory | Where-Object { $_.ResourceId -eq $cosmos.id -and $_.ImpactScope -eq 'SecondaryRegion' }).Count -eq 1) 'Final inventory includes the Cosmos account through its secondary region.'
+        }
+        finally { $testState.testResources[$subA] = $originalResources }
 
         $zip = [IO.Compression.ZipFile]::OpenRead($run.Workbook)
         try {

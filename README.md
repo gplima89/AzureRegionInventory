@@ -522,6 +522,12 @@ subscription; compare the scope against the client's authoritative inventory.
 
 ### Incomplete or unexpected results
 
+- **`Cannot convert value "name" to type "System.Int32"` in the Resources error
+  message:** older collector versions incorrectly iterated a wrapped AKS
+  node-pool array as a single object. Update the collector and rerun to a new
+  output folder. The fix also corrects iteration of Cosmos DB region arrays,
+  which could previously miss secondary-region impact. Existing partial
+  inventories are not repaired automatically.
 - **`PARTIAL inventory saved`:** inspect the `Errors` and `ScopeAudit` worksheets,
   then fix the reported dataset/scope failures. Some rows may already have been
   saved from a failed token chain. Do not present that workbook as a complete
