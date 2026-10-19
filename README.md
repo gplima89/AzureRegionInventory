@@ -85,9 +85,12 @@ Every run performs preflight checks before creating inventory files:
 - **Az.Accounts, Az.ResourceGraph and Az.Resources** must be installed and
   importable, with the required authentication/context/query parameters.
   No CLI extension or full Az rollup installation is needed.
-- Requested tenant/subscription visibility and Enabled subscription state.
+- Requested tenant/subscription visibility and subscription states.
   One `Get-AzSubscription -TenantId` call discovers subscription metadata;
   explicit IDs are validated against this list and deduplicated.
+  Non-Enabled subscriptions produce warnings but remain in the ARG query scope.
+  At least one Enabled subscription in that scope is required for the Azure
+  context; the first Enabled subscription is used, not simply the first listed.
 - **One live ARG count query for the whole selected scope**, testing token
   refresh, network access and query access rather than relying on cached
   `Get-AzContext` metadata alone. This is tenant-wide by default, or restricted
@@ -97,7 +100,7 @@ Every run performs preflight checks before creating inventory files:
   The probe is deleted on close. Final directory/file creation remains subject
   to normal filesystem checks; the probe does not guarantee disk space.
 
-Region-name lookup uses `Get-AzLocation` with the first selected subscription's context.
+Region-name lookup uses `Get-AzLocation` with the first Enabled subscription's context.
 It validates names only, not destination eligibility for every selected
 subscription. ARG inventory/count queries retain the selected tenant or combined
 subscription-array scope, regardless of the context's default subscription.
@@ -123,6 +126,12 @@ Add `-Login` if you want to sign in first. An existing Azure CLI `az login`
 session does **not** authenticate Az PowerShell; use `Connect-AzAccount`.
 Live query success proves access only to visible/indexed resources, not complete
 tenant RBAC coverage, and does not validate destination deployment readiness.
+Non-Enabled subscription IDs/states are included in `Preflight.json` check
+details, `Run.json` under `NonEnabledSubscriptions`, and the workbook's `Coverage`
+sheet. These are warnings, not automatic exclusions or reactivation attempts.
+Azure may expose fewer resources for such subscriptions: a count-reconciled
+`Completed` run does not establish their full resource coverage. Actual ARG
+authorization/query failures still stop preflight or mark collection `Partial`.
 
 ## Run
 
@@ -459,7 +468,8 @@ each subsequent collection attempt; the collector cannot resume an interrupted r
 | `UseDeviceCode requires Login` | Device-code option was supplied without requesting sign-in | Supply both switches: `-Login -UseDeviceCode`. |
 | `Subscription not visible`, discovery failed or `No subscriptions in the requested scope` | Incorrect tenant/ID, missing subscription visibility, or stale authentication | Sign in to the correct tenant, inspect `Get-AzSubscription`, and verify requested GUIDs and Reader access. Do not remove required subscriptions just to obtain a passing run. |
 | `Cross-tenant arrays are not supported` | Requested IDs are not all visible in the current/selected tenant | Select the correct `-TenantId` and verify access. For IDs belonging to different tenants, run separately per tenant and record the dependency-analysis boundary. The script does not widen scope automatically. |
-| Subscription is `Disabled` or otherwise not `Enabled` | Subscription state does not permit this collection | Ask the subscription administrator to investigate. Exclude it only if the inventory owner explicitly accepts the reduced scope and records the gap. |
+| Subscription is `Disabled` or otherwise not `Enabled` | Azure reports a non-Enabled subscription state | The current collector warns, keeps the subscription in ARG scope, records its state, and uses an Enabled subscription for the context. If an older copy still throws `Correct the scope or subscription state`, replace it with the updated collector. Review coverage with the administrator; a successful query does not guarantee Azure exposes all resources in that subscription. |
+| `No Enabled subscription is available in the requested scope` | None of the selected subscriptions can be used for the Azure context | Include an Enabled subscription from the same tenant, or ask the subscription administrator to investigate. With explicit IDs, include both the original IDs and the Enabled ID; this deliberately expands that explicit scope. Do not silently drop the original subscriptions or assume the script reactivates them. |
 
 ### Azure query and pagination errors
 
@@ -571,7 +581,8 @@ the inventory. To run the development suite, keep
 
 Tests use mocked Az cmdlets and make **no Azure connection**. They cover
 preflight-only mode, module/session checks, live-query failures,
-disabled or missing subscriptions, invalid regions and output paths, plus a
+non-Enabled subscription warnings and audit records, missing subscriptions,
+all-disabled scope failures, invalid regions and output paths, plus a
 100,001-resource scope, >1,000-resource multi-subscription orchestration, continuation tokens,
 empty/exact-page scopes, duplicates, malformed responses, count mismatches, retry behavior,
 tenant-default and combined-array scope/context forwarding, cross-tenant array

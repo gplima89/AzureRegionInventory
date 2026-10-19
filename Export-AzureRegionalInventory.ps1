@@ -16,6 +16,7 @@ Optional destination for planning context only; does not validate deployment rea
 .PARAMETER SubscriptionId
 Optional subscription IDs queried together. If omitted, uses tenant-wide scope.
 All supplied subscriptions must be visible in the selected/current tenant.
+Non-Enabled subscriptions remain in query scope and are reported as warnings.
 .PARAMETER TenantId
 Optional tenant scope. Defaults to the current Az context's tenant, not every signed-in tenant.
 .PARAMETER OutputDirectory
@@ -675,12 +676,22 @@ function Test-InventoryPrerequisites {
     if ($accounts.Count -eq 0) { throw 'No subscriptions in the requested scope. Check tenant, Connect-AzAccount and subscription Reader access.' }
     $scopeType = if ($SubscriptionId) { 'Subscriptions' } else { 'Tenant' }
     $scopeLabel = if ($SubscriptionId) { "$($requestedIds.Count) subscriptions in tenant $effectiveTenantId" } else { "Tenant $effectiveTenantId" }
-    Add-PreflightCheck 'Account scope' "$scopeLabel; $($accounts.Count) visible subscription metadata records"
-    foreach ($account in $accounts) {
-        if ($account.state -ne 'Enabled') { throw "Subscription $($account.id) is $($account.state), not Enabled. Correct the scope or subscription state." }
+    $nonEnabledAccounts = @($accounts | Where-Object { $_.state -ne 'Enabled' })
+    foreach ($account in $nonEnabledAccounts) {
+        Write-Warning "Subscription $($account.id) ($($account.name)) is $($account.state), not Enabled. It remains in the ARG query scope; Azure may not expose all of its resources. Review its state with the subscription administrator."
+    }
+    $stateSummary = if ($nonEnabledAccounts.Count) {
+        'Non-Enabled subscriptions retained in query scope: ' +
+        (($nonEnabledAccounts | ForEach-Object { "$($_.id) ($($_.state))" }) -join '; ') +
+        '. ARG visibility is not proof of complete inventory for these subscriptions.'
+    } else { 'All discovered subscriptions in the requested scope are Enabled.' }
+    Add-PreflightCheck 'Account scope' "$scopeLabel; $($accounts.Count) visible subscription metadata records. $stateSummary"
+    $enabledAccounts = @($accounts | Where-Object { $_.state -eq 'Enabled' })
+    if ($enabledAccounts.Count -eq 0) {
+        throw 'No Enabled subscription is available in the requested scope to establish the Azure context. Include an Enabled subscription from the same tenant, or ask the subscription administrator to investigate subscription states.'
     }
     try {
-        $context = Set-AzContext -Subscription $accounts[0].id -Tenant $effectiveTenantId -Scope Process -ErrorAction Stop -Verbose:$false
+        $context = Set-AzContext -Subscription $enabledAccounts[0].id -Tenant $effectiveTenantId -Scope Process -ErrorAction Stop -Verbose:$false
         $initialCount = Get-ArgCount -SubscriptionId $requestedIds -BaseQuery 'Resources' -DefaultProfile $context
     }
     catch {
@@ -714,6 +725,7 @@ function Test-InventoryPrerequisites {
         Checks = $checks.ToArray(); Accounts = $accounts; OutputDirectory = $outputPath
         InitialCount = $initialCount; Context = $context; TenantId = $effectiveTenantId
         SubscriptionIds = $requestedIds; ScopeType = $scopeType; ScopeLabel = $scopeLabel
+        NonEnabledSubscriptions = $nonEnabledAccounts; SubscriptionStateSummary = $stateSummary
     }
 }
 
@@ -753,6 +765,7 @@ function Invoke-RegionalInventory {
         SourceRegion = $SourceRegion; TargetRegion = $TargetRegion; DependencyScope = $DependencyScope
         ScopeType = $preflight.ScopeType; TenantId = $preflight.TenantId
         SubscriptionsRequested = $preflight.SubscriptionIds; SubscriptionsDiscovered = @($accounts.id); ScopeFailures = 0
+        NonEnabledSubscriptions = $preflight.NonEnabledSubscriptions
         Note = 'Read-only ARG metadata; not a transactionally consistent snapshot or proof of migration readiness.'
     }
     [IO.File]::WriteAllText($manifestPath, (ConvertTo-Json $manifest -Depth 10))
@@ -983,6 +996,7 @@ function Invoke-RegionalInventory {
         $coverage = @(
             @('Run status', $(if ($failureCount) { 'PARTIAL - review Errors and ScopeAudit' } else { 'Requested query scope count-reconciled' })),
             @('Query scope', "$($preflight.ScopeType): $($preflight.ScopeLabel). Default is the current tenant, not all signed-in tenants. Explicit subscriptions are queried together."),
+            @('Subscription states', $preflight.SubscriptionStateSummary),
             @('Scope', "$SourceRegion primary location, known storage/Cosmos secondary locations, and regionless children of indexed source-region ARM parents. GlobalContext is separate, not counted as impacted."),
             @('Dependency scope', $DependencyScope),
             @('Visibility', 'Only Az PowerShell-visible subscriptions and ARG-indexed resources permitted by RBAC. Hidden subscriptions/resources cannot be proven absent.'),

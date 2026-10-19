@@ -279,8 +279,8 @@ try {
             [CmdletBinding()]param($DefaultProfile, $SubscriptionId, $TenantId)
             $testState.subscriptionCalls.Add(@{} + $PSBoundParameters)
             @(
-                [pscustomobject]@{ Id = $subB; Name = 'Shared'; TenantId = 'tenant-a'; State = $(if ($testState.preflightScenario -eq 'Disabled') {'Disabled'} else {'Enabled'}) }
-                [pscustomobject]@{ Id = $subA; Name = 'Workloads'; TenantId = 'tenant-a'; State = 'Enabled' }
+                [pscustomobject]@{ Id = $subB; Name = 'Shared'; TenantId = 'tenant-a'; State = $(if ($testState.preflightScenario -eq 'AllDisabled') {'Disabled'} elseif ($testState.preflightScenario -in @('Disabled','Warned','PastDue')) {$testState.preflightScenario} else {'Enabled'}) }
+                [pscustomobject]@{ Id = $subA; Name = 'Workloads'; TenantId = 'tenant-a'; State = $(if ($testState.preflightScenario -eq 'AllDisabled') {'Disabled'} else {'Enabled'}) }
                 [pscustomobject]@{ Id = $subC; Name = 'Other tenant'; TenantId = 'tenant-b'; State = 'Enabled' }
             ) | Where-Object { (-not $SubscriptionId -or $_.Id -eq $SubscriptionId) -and (-not $TenantId -or $_.TenantId -eq $TenantId) }
         }
@@ -337,13 +337,28 @@ try {
         foreach ($case in @(
             @('OldModule', 'Update the owning Az module'),
             @('MissingModule', 'Install-Module'), @('LoggedOut', 'Connect-AzAccount'),
-            @('ExpiredToken', 'Live ARG preflight failed'), @('Disabled', 'not Enabled')
+            @('ExpiredToken', 'Live ARG preflight failed'), @('AllDisabled', 'No Enabled subscription')
         )) {
             $testState.preflightScenario = $case[0]
             Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $checkPath -CheckOnly } $case[1]
             Assert-True (-not (Test-Path $checkPath)) "Preflight failure $($case[0]) stops before output collection."
             Assert-True ($testState.currentContext -eq $testState.originalContext) "Context restored after $($case[0]) failure."
         }
+        foreach ($state in @('Disabled','Warned','PastDue')) {
+            $testState.preflightScenario = $state
+            $testState.graphCalls.Clear()
+            $stateWarnings = @()
+            $statePreflight = Test-InventoryPrerequisites -SourceRegion southeastasia -OutputDirectory $checkPath -WarningVariable stateWarnings
+            Assert-True ($statePreflight.Accounts.Count -eq 2 -and $statePreflight.NonEnabledSubscriptions.Count -eq 1 -and $statePreflight.NonEnabledSubscriptions[0].state -eq $state) "State $state is recorded without excluding its subscription."
+            Assert-True ($statePreflight.Context.Subscription.Id -eq $subA -and $testState.currentContext -eq $testState.originalContext) "State $state uses an Enabled context and restores the original context."
+            Assert-True ($testState.graphCalls.Count -eq 1 -and $testState.graphCalls[0].UseTenantScope -and -not $testState.graphCalls[0].ContainsKey('Subscription')) "State $state preserves tenant-wide ARG scope."
+            Assert-True (@($stateWarnings | Where-Object { "$_" -match $subB -and "$_" -match $state }).Count -eq 1) "State $state emits an actionable subscription warning."
+            Assert-True ($statePreflight.Checks[3].Details -match $subB) "State $state is recorded in the saved preflight checks."
+        }
+        $testState.preflightScenario = 'Disabled'
+        $stateArray = Test-InventoryPrerequisites -SourceRegion southeastasia -SubscriptionId @($subB,$subA) -OutputDirectory $checkPath
+        Assert-True ($stateArray.SubscriptionIds.Count -eq 2 -and $testState.graphCalls[-1].Subscription -contains $subB -and -not $testState.graphCalls[-1].ContainsKey('UseTenantScope')) 'Explicit arrays retain non-Enabled subscriptions without tenant expansion.'
+        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -SubscriptionId $subB -OutputDirectory $checkPath -CheckOnly } 'No Enabled subscription'
         $testState.preflightScenario = ''
         $testState.graphHandler = $testState.completeHandler
         $out = Join-Path $TestRoot 'complete'
@@ -378,6 +393,15 @@ try {
         Assert-True (@($testState.graphCalls | Where-Object { $_.ContainsKey('UseTenantScope') -or $_.Subscription.Count -ne 2 }).Count -eq 0) 'Every explicit-array query retains the same full array without tenant expansion.'
         $arrayManifest = Get-Content (Join-Path $arrayOut 'Run.json') -Raw | ConvertFrom-Json
         Assert-True ($arrayManifest.ScopeType -eq 'Subscriptions' -and $arrayManifest.SubscriptionsRequested.Count -eq 2) 'Explicit-array scope is persisted accurately.'
+        $testState.preflightScenario = 'Disabled'
+        $stateOut = Join-Path $TestRoot 'disabled-subscription'
+        $stateRun = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $stateOut
+        $stateManifest = Get-Content (Join-Path $stateOut 'Run.json') -Raw | ConvertFrom-Json
+        Assert-True ($stateManifest.Status -eq 'Completed' -and $stateRun.IndexedResources -eq 1007 -and $stateManifest.SubscriptionsDiscovered -contains $subB) 'A disabled subscription does not stop collection or remove its resources.'
+        Assert-True ($stateManifest.NonEnabledSubscriptions.Count -eq 1 -and $stateManifest.NonEnabledSubscriptions[0].id -eq $subB -and $stateManifest.NonEnabledSubscriptions[0].state -eq 'Disabled') 'Run manifest persists the non-Enabled subscription and state.'
+        $stateCoverage = @(Get-JsonLines (Join-Path $stateOut 'Coverage.jsonl'))
+        Assert-True (@($stateCoverage | Where-Object { $_.Topic -eq 'Subscription states' -and $_.Notes -match $subB -and $_.Notes -match 'not proof of complete inventory' }).Count -eq 1) 'Workbook coverage records the subscription-state visibility caveat.'
+        $testState.preflightScenario = ''
 
         $zip = [IO.Compression.ZipFile]::OpenRead($run.Workbook)
         try {
