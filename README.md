@@ -242,6 +242,11 @@ not prevent resource collection. Any unrecovered dataset failure makes the run `
 
 Duplicate resource IDs or count mismatches trigger **up to two clean retries
 per dataset** (three attempts total), with two- then four-second pauses.
+If the third attempt is still inconsistent, it does not fail: it keeps the first
+occurrence of each ID, accepts the count difference, and the run finishes as
+`Approximate` with a warning at the end. `Run.json` lists the affected datasets
+in `ApproximateDatasets`. `ScopeAudit` records `DuplicateRows` and
+`DifferenceBefore`/`DifferenceAfter`.
 Each retry discards that dataset's prior staged rows and, for Resources,
 its resource/SKU index and impacted-ID set. It starts from page 1 without the
 old continuation token, using a fresh count with the same regional filter and
@@ -524,7 +529,7 @@ each subsequent collection attempt; the collector cannot resume an interrupted r
 | `429`, `TooManyRequests`, or transient 502/503/504 warnings | Azure throttling or a transient service failure | Allow the built-in bounded retries to finish. If exhausted, reduce competing inventory jobs, wait and rerun with a new output path. Splitting subscription batches can reduce competing load; keep records of the full intended scope. |
 | `Unknown source region` / `Unknown target region` | A display name or misspelled region was supplied | Use the canonical `Location` from `Get-AzLocation`, such as `southeastasia`, not `Southeast Asia`. |
 | `SourceRegion and TargetRegion must be different` | The same region was supplied twice | Correct the destination, or omit `-TargetRegion` when only gathering inventory. |
-| `ARG count mismatch` or `Duplicate resource ID while paging` | Resources changed during collection, ARG indexing changed, or paging was inconsistent | Allow up to two automatic clean dataset retries to finish. Review `RETRY` rows and attempt numbers in `ScopeAudit`. If recovery is exhausted, rerun during a quieter window using a new output folder. Do not disable reconciliation or ignore duplicates to force success. |
+| `ARG count mismatch` or `Duplicate resource ID while paging` | Resources changed during collection, ARG indexing changed, or paging was inconsistent | Up to two automatic clean dataset retries run first. If the third attempt is still inconsistent, the run completes as `Approximate` with a warning instead of failing. Review `RETRY` rows, `DuplicateRows` and differences in `ScopeAudit`. For a reconciled snapshot, rerun during a quieter window using a new output folder. |
 | Repeated continuation token, empty page with a token, or count mismatch after a missing token | Unexpected ARG response or a modified query that is not pageable | Check Az.ResourceGraph compatibility. Retain scalar `id`, stable ordering and token handling; remove `take`, `limit` or `sample` operators. Never treat the first 1,000 rows as the complete result. |
 | Invalid ARG count response or `Data and SkipToken are required` | Incompatible tooling or a custom query/response-shaping change | Check Az module versions and reproduce the small count query below. Preserve the response object until `SkipToken` is read; do not enumerate or project it away. Never replace failed responses with empty inventories. |
 
@@ -583,12 +588,13 @@ subscription; compare the scope against the client's authoritative inventory.
   this is a collection consistency error, not an Excel export error. The estate
   or ARG index may have changed between pages; the duplicate alone does not
   establish the cause. The collector retries the whole affected dataset with
-  clean staging/indexes and fresh counts up to twice. If all three attempts
-  fail, retry to a new output folder during a quieter backup/deployment window.
+  clean staging/indexes and fresh counts up to twice. If the third attempt is
+  still inconsistent, it keeps the first occurrence of each ID and the run ends
+  as `Approximate` with a final warning. For a count-reconciled snapshot, rerun
+  to a new output folder during a quieter backup/deployment window.
   If a regional scan takes too long, consider
   explicit smaller subscription arrays; collection already uses a regional
-  resource filter. Document the scope and SKU/parent-lookup boundaries. Do not silently drop
-  duplicates or exclude backup resources to label an inventory complete.
+  resource filter. Document the scope and SKU/parent-lookup boundaries.
 - **`ServiceCategory` is `Not classified`:** read `ServiceCategoryBasis`. The
   resource type or VM series is not in the supplied list, the VM size was not
   exposed, or the ring depends on a parent resource. If Microsoft has added the

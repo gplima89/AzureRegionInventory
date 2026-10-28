@@ -175,6 +175,12 @@ try {
             elseif ($mode -eq 'DuplicateAlways') {
                 Assert-Throws { Invoke-ArgPaged @recoveryOptions } 'Duplicate resource ID'
                 Assert-True ($testState.recoveryStarts -eq 3 -and $testState.recoveryRestarts -eq 2 -and $testState.recoveryRows.Count -eq 2) 'Persistent duplicates stop after three attempts and retain only last-attempt rows.'
+                $testState.recoveryStarts = 0
+                $testState.recoveryRestarts = 0
+                $testState.recoveryRows.Clear()
+                $approximate = Invoke-ArgPaged @recoveryOptions -ApproximateOnFinalAttempt -WarningAction SilentlyContinue
+                Assert-True ($approximate.Status -eq 'Approximate' -and $approximate.Attempts -eq 3 -and $approximate.DuplicateRows -eq 1 -and $approximate.Downloaded -eq 3) 'ApproximateOnFinalAttempt keeps first occurrences on the third attempt.'
+                Assert-True ($testState.recoveryRestarts -eq 2 -and ($testState.recoveryRows -join ',') -eq 'one,two,three') 'Approximate final attempt starts from clean output and passes unique rows only.'
             }
             else {
                 Assert-Throws { Invoke-ArgPaged @recoveryOptions } 'AuthorizationFailed'
@@ -704,14 +710,18 @@ try {
         Assert-True ($resourcePartial.Status -eq 'Partial' -and $resourcePartial.IndexedResources -eq 1000) 'Continuation failure preserves partial rows without claiming success.'
         $testState.simulateResourceFailure = $false
         $testState.simulateResourceDuplicate = $true
-        $duplicateOut = Join-Path $TestRoot 'duplicate-partial'
-        Assert-Throws { Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $duplicateOut } '(?s)PARTIAL inventory saved.*\[Resources\] Duplicate resource ID while paging'
+        $duplicateOut = Join-Path $TestRoot 'duplicate-approximate'
+        $duplicateRun = Invoke-RegionalInventory -SourceRegion southeastasia -OutputDirectory $duplicateOut -WarningVariable duplicateWarnings -WarningAction SilentlyContinue
         $duplicateManifest = Get-Content (Join-Path $duplicateOut 'Run.json') -Raw | ConvertFrom-Json
-        Assert-True ($duplicateManifest.Status -eq 'Partial' -and $duplicateManifest.CollectionErrors[0].Message -match 'Duplicate resource ID') 'Duplicate paging errors remain explicit in both the final exception and manifest.'
+        Assert-True ($duplicateRun.Status -eq 'Approximate' -and $duplicateManifest.Status -eq 'Approximate' -and $duplicateManifest.ScopeFailures -eq 0) 'Persistent duplicates after three attempts complete as Approximate instead of Partial.'
+        Assert-True ($duplicateManifest.ApproximateDatasets.Count -eq 1 -and $duplicateManifest.ApproximateDatasets[0] -match '^Resources: 1 duplicate') 'Manifest records which dataset is approximate.'
+        Assert-True ((@($duplicateWarnings) -join "`n") -match 'Inventory is APPROXIMATE') 'A final approximate-inventory warning is printed.'
         $duplicateAudit = @(Get-JsonLines (Join-Path $duplicateOut 'ScopeAudit.jsonl'))
-        Assert-True ($duplicateManifest.PagingConsistencyRetries -eq 2 -and $duplicateManifest.IndexedResources -eq 1000 -and
+        Assert-True ($duplicateManifest.PagingConsistencyRetries -eq 2 -and $duplicateManifest.IndexedResources -eq 1005 -and
             @($duplicateAudit | Where-Object { $_.Status -eq 'RETRY - attempt discarded' }).Count -eq 2 -and
-            @($duplicateAudit | Where-Object { $_.Dataset -eq 'Resources' -and $_.Attempt -eq 3 -and $_.Status -like 'FAILED*' }).Count -eq 1) 'Exhausted retries are bounded, audited, and preserve only the final partial attempt.'
+            @($duplicateAudit | Where-Object { $_.Dataset -eq 'Resources' -and $_.Attempt -eq 3 -and $_.Status -eq 'Approximate' -and $_.DuplicateRows -eq 1 }).Count -eq 1) 'Exhausted strict retries are audited and the final attempt keeps first occurrences only.'
+        $duplicateCoverage = @(Get-JsonLines (Join-Path $duplicateOut 'Coverage.jsonl'))
+        Assert-True (@($duplicateCoverage | Where-Object { $_.Topic -eq 'Run status' -and $_.Notes -match '^APPROXIMATE' }).Count -eq 1) 'Workbook coverage labels the run approximate.'
         $testState.simulateResourceDuplicate = $false
         $originalRecoveryResources = $testState.testResources[$subA]
         $testState.simulateResourceDuplicateOnce = $true

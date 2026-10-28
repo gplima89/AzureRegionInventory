@@ -156,7 +156,8 @@ function Invoke-ArgPaged {
         [string]$DatasetName = 'Resources',
         [ValidateRange(0, 2)][int]$MaxConsistencyRetries = 0,
         [scriptblock]$OnRestart,
-        [switch]$BestEffort
+        [switch]$BestEffort,
+        [switch]$ApproximateOnFinalAttempt
     )
     if ($BestEffort) { $MaxConsistencyRetries = 0 }
     if ($MaxConsistencyRetries -gt 0 -and $null -eq $OnRestart) {
@@ -165,6 +166,8 @@ function Invoke-ArgPaged {
     $scopeLabel = if ($SubscriptionId) { "Subscriptions ($($SubscriptionId.Count))" } else { 'Tenant' }
     $query = "$BaseQuery | project $Projection | order by id asc"
     for ($attempt = 0; ; $attempt++) {
+        # Final attempt keeps the first occurrence of each ID and reports count differences instead of failing.
+        $tolerant = $BestEffort -or ($ApproximateOnFinalAttempt -and $attempt -ge $MaxConsistencyRetries)
         $expected = if ($attempt -eq 0 -and $PSBoundParameters.ContainsKey('InitialCount')) { $InitialCount }
             else { Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile }
         $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -174,7 +177,9 @@ function Invoke-ArgPaged {
         $downloaded = 0L
         $returnedRows = 0L
         $duplicateRows = 0L
-        Write-Host "  Starting $DatasetName paging attempt $($attempt + 1)/$($MaxConsistencyRetries + 1); expected $expected rows [$scopeLabel]"
+        $countDifference = $false
+        $mode = if ($tolerant -and -not $BestEffort) { ' (final attempt: tolerating duplicates/count differences)' } else { '' }
+        Write-Host "  Starting $DatasetName paging attempt $($attempt + 1)/$($MaxConsistencyRetries + 1)$mode; expected $expected rows [$scopeLabel]"
         try {
             do {
                 $response = Invoke-InventoryGraph -SubscriptionId $SubscriptionId -DefaultProfile $DefaultProfile `
@@ -187,7 +192,7 @@ function Invoke-ArgPaged {
                 foreach ($row in $rows) {
                     if (-not $row.id) { throw 'Every paged query must project id.' }
                     if (-not $seen.Add([string]$row.id)) {
-                        if ($BestEffort) {
+                        if ($tolerant) {
                             $duplicateRows++
                             $pageDuplicates++
                             continue
@@ -202,7 +207,7 @@ function Invoke-ArgPaged {
                 $downloaded += $uniqueRows.Count
                 $returnedRows += $rows.Count
                 if ($pageDuplicates) {
-                    Write-Warning "$DatasetName best-effort page $pages : ignored $pageDuplicates duplicate row(s); kept the first occurrence of each ID. Inventory is approximate."
+                    Write-Warning "$DatasetName page $pages : ignored $pageDuplicates duplicate row(s); kept the first occurrence of each ID. Inventory is approximate."
                 }
                 $token = $response['skipToken']
                 if ($token -and -not $tokens.Add([string]$token)) { throw 'ARG returned a repeated continuation token.' }
@@ -211,8 +216,9 @@ function Invoke-ArgPaged {
             } while ($token)
             $after = Get-ArgCount -SubscriptionId $SubscriptionId -BaseQuery $BaseQuery -DefaultProfile $DefaultProfile
             if ($seen.Count -ne $expected -or $after -ne $expected) {
-                if ($BestEffort) {
-                    Write-Warning "$DatasetName best-effort count difference: before=$expected, unique downloaded=$downloaded, after=$after. No count-difference limit is applied; inventory is approximate."
+                if ($tolerant) {
+                    $countDifference = $true
+                    Write-Warning "$DatasetName count difference accepted: before=$expected, unique downloaded=$downloaded, after=$after. No count-difference limit is applied; inventory is approximate."
                 }
                 else {
                     $pagingError = [InvalidOperationException]::new("ARG count mismatch for $scopeLabel : before=$expected, downloaded=$($seen.Count), after=$after. Rerun in a quieter window.")
@@ -224,7 +230,7 @@ function Invoke-ArgPaged {
                 Expected = $expected; Downloaded = $downloaded; Pages = $pages; After = $after; Attempts = ($attempt + 1)
                 ReturnedRows = $returnedRows; DuplicateRows = $duplicateRows
                 DifferenceBefore = ($downloaded - $expected); DifferenceAfter = ($downloaded - $after)
-                Status = $(if ($BestEffort) { 'Approximate' } else { 'CountReconciled' })
+                Status = $(if ($BestEffort -or $duplicateRows -or $countDifference) { 'Approximate' } else { 'CountReconciled' })
             }
         }
         catch {
@@ -1089,7 +1095,7 @@ function Invoke-RegionalInventory {
     $null = New-Item -ItemType Directory -Path $OutputDirectory
     [IO.File]::WriteAllText((Join-Path $OutputDirectory 'Preflight.json'), (ConvertTo-Json -InputObject $preflight.Checks -Depth 10))
     $manifestPath = Join-Path $OutputDirectory 'Run.json'
-    $pagingState = @{ ConsistencyRetries = 0 }
+    $pagingState = @{ ConsistencyRetries = 0; Approximate = [Collections.Generic.List[string]]::new() }
     $manifest = [ordered]@{
         Status = 'Collecting'; StartedUtc = [DateTime]::UtcNow.ToString('o'); FinishedUtc = ''
         SourceRegion = $SourceRegion; TargetRegion = $TargetRegion; ResourceScope = 'Regional'
@@ -1118,7 +1124,7 @@ function Invoke-RegionalInventory {
     try {
             Write-Host "Collecting $($preflight.ScopeLabel); regional resources for $SourceRegion plus global/regionless and known secondary-region context. Resource-group metadata covers the full selected scope."
             try {
-                $rgAudit = Invoke-ArgPaged @graphOptions -DatasetName ResourceGroups -MaxConsistencyRetries 2 -OnRestart {
+                $rgAudit = Invoke-ArgPaged @graphOptions -DatasetName ResourceGroups -MaxConsistencyRetries 2 -ApproximateOnFinalAttempt -OnRestart {
                         param($retry)
                         $pagingState.ConsistencyRetries++
                         Write-JsonLine $writers.ScopeAudit ($auditScope + @{
@@ -1145,6 +1151,7 @@ function Invoke-RegionalInventory {
                     ReturnedRows = $rgAudit.ReturnedRows; DuplicateRows = $rgAudit.DuplicateRows
                     DifferenceBefore = $rgAudit.DifferenceBefore; DifferenceAfter = $rgAudit.DifferenceAfter
                 })
+                if ($rgAudit.Status -eq 'Approximate') { $pagingState.Approximate.Add("ResourceGroups: $($rgAudit.DuplicateRows) duplicate row(s) ignored; before=$($rgAudit.Expected), unique downloaded=$($rgAudit.Downloaded), after=$($rgAudit.After)") }
             }
             catch {
                 $failureCount++
@@ -1158,7 +1165,7 @@ function Invoke-RegionalInventory {
             try {
                 $pagingOptions = $graphOptions.Clone()
                 $pagingOptions.InitialCount = $preflight.InitialCount
-                $audit = Invoke-ArgPaged @pagingOptions -MaxConsistencyRetries 2 -OnRestart {
+                $audit = Invoke-ArgPaged @pagingOptions -MaxConsistencyRetries 2 -ApproximateOnFinalAttempt -OnRestart {
                     param($retry)
                     $pagingState.ConsistencyRetries++
                     Write-JsonLine $writers.ScopeAudit ($auditScope + @{
@@ -1201,6 +1208,7 @@ function Invoke-RegionalInventory {
                     ReturnedRows = $audit.ReturnedRows; DuplicateRows = $audit.DuplicateRows
                     DifferenceBefore = $audit.DifferenceBefore; DifferenceAfter = $audit.DifferenceAfter
                 })
+                if ($audit.Status -eq 'Approximate') { $pagingState.Approximate.Add("Resources: $($audit.DuplicateRows) duplicate row(s) ignored; before=$($audit.Expected), unique downloaded=$($audit.Downloaded), after=$($audit.After)") }
             }
             catch {
                 $failureCount++
@@ -1296,14 +1304,14 @@ function Invoke-RegionalInventory {
             })
         }
         $coverage = @(
-            @('Run status', $(if ($failureCount) { 'PARTIAL - review Errors and ScopeAudit' } elseif ($BestEffort) { 'APPROXIMATE - best-effort inventory; not a reconciled snapshot. Review ScopeAudit for duplicates and count differences.' } else { 'Requested query scope count-reconciled' })),
+            @('Run status', $(if ($failureCount) { 'PARTIAL - review Errors and ScopeAudit' } elseif ($BestEffort) { 'APPROXIMATE - best-effort inventory; not a reconciled snapshot. Review ScopeAudit for duplicates and count differences.' } elseif ($pagingState.Approximate.Count) { "APPROXIMATE - paging consistency was not reached after 3 attempts; the final attempt kept the first occurrence of each ID. $($pagingState.Approximate -join ' | ')" } else { 'Requested query scope count-reconciled' })),
             @('Query scope', "$($preflight.ScopeType): $($preflight.ScopeLabel). Default is the current tenant, not all signed-in tenants. Explicit subscriptions are queried together."),
             @('Subscription states', $preflight.SubscriptionStateSummary),
             @('Scope', "$SourceRegion primary location, known storage/Cosmos secondary locations, and regionless children of indexed source-region ARM parents. GlobalContext is separate, not counted as impacted."),
             @('Resource collection', 'Regional filter only: primary source region, known secondary-region fields, and global/regionless context. Resource-group metadata covers the selected scope. No all-regions resource scan.'),
             @('Visibility', 'Only Az PowerShell-visible subscriptions and ARG-indexed resources permitted by RBAC. Hidden subscriptions/resources cannot be proven absent.'),
             @('Pagination', 'One tenant-wide or explicit-subscription-array token chain per dataset; Search-AzGraph -First 1000 -SkipToken. Partial subscription scopes are not allowed. Strict mode enforces unique IDs and before/after counts; best-effort mode keeps first-observed IDs and records differences. Equality cannot detect all concurrent changes.'),
-            @('Paging recovery', $(if ($BestEffort) { 'Best-effort mode: no dataset restarts for duplicates/count changes and no count-difference limit. Review ReturnedRows, DuplicateRows, Downloaded and DifferenceBefore/After in ScopeAudit. Missing or changing resources cannot be reconstructed.' } else { "$($pagingState.ConsistencyRetries) discarded attempt(s). Duplicate IDs and count mismatches allow up to two clean retries per dataset with fresh counts and reset output/indexes. Review RETRY rows in ScopeAudit; exhausted recovery remains Partial." })),
+            @('Paging recovery', $(if ($BestEffort) { 'Best-effort mode: no dataset restarts for duplicates/count changes and no count-difference limit. Review ReturnedRows, DuplicateRows, Downloaded and DifferenceBefore/After in ScopeAudit. Missing or changing resources cannot be reconstructed.' } else { "$($pagingState.ConsistencyRetries) discarded attempt(s). Duplicate IDs and count mismatches allow up to two clean retries per dataset with fresh counts and reset output/indexes. If the third attempt is still inconsistent, it keeps the first occurrence of each ID, records differences, and the run is Approximate. Review RETRY rows in ScopeAudit." })),
             @('Summary', 'Measured snapshot counts by subscription/type/impact scope. MissingTags means no tags, not missing mandatory business tags. SKU unknown includes not applicable.'),
             @('SKU', 'Service-specific units are not interchangeable. App plans are shared; do not sum app inherited workers. AKS node sizes are distinct from control-plane SKU.'),
             @('Service category', 'Ring 0/1/2 from the Azure services-by-category list (learn.microsoft.com/azure/reliability/availability-service-by-category) mapped to ARM resource types in the script. VMs use VM series from VmSize; VMSS/AKS use the most restrictive of the service ring and listed node/instance series. Inferred rows are components/children of a listed service. Not classified = type/series absent from the list. Rings describe regional service availability, not workload criticality; recheck the list as it changes.'),
@@ -1340,7 +1348,8 @@ function Invoke-RegionalInventory {
         Move-Item -LiteralPath ($workbookPath + '.partial') -Destination $workbookPath
         # Only normalized, selected metadata is staged; arbitrary ARG properties are not persisted.
         [IO.File]::Delete($paths.InventoryStaging)
-        $manifest.Status = if ($failureCount) { 'Partial' } elseif ($BestEffort) { 'Approximate' } else { 'Completed' }
+        $manifest.Status = if ($failureCount) { 'Partial' } elseif ($BestEffort -or $pagingState.Approximate.Count) { 'Approximate' } else { 'Completed' }
+        $manifest.ApproximateDatasets = @($pagingState.Approximate)
         $manifest.ScopeFailures = $failureCount
         $manifest.FinishedUtc = [DateTime]::UtcNow.ToString('o')
         $manifest.Workbook = $workbookPath
@@ -1358,6 +1367,11 @@ function Invoke-RegionalInventory {
             throw "PARTIAL inventory saved to $workbookPath. $failureCount datasets failed for the requested query scope; review Errors and ScopeAudit. Original collection error(s):$([Environment]::NewLine)$failureDetails"
         }
         Write-Host "$($manifest.Status): $workbookPath ($($impacted.Count) impacted resources; $($index.Count) resources indexed)."
+        if ($pagingState.Approximate.Count) {
+            Write-Warning ("Inventory is APPROXIMATE: ARG paging consistency was not reached after 3 attempts, so the final attempt kept the first occurrence of each ID.$([Environment]::NewLine)" +
+                (($pagingState.Approximate | ForEach-Object { "  - $_" }) -join [Environment]::NewLine) +
+                "$([Environment]::NewLine)Review ScopeAudit (DuplicateRows, DifferenceBefore/After). Rerun in a quieter window for a count-reconciled snapshot.")
+        }
         [pscustomobject]@{ Status = $manifest.Status; Workbook = $workbookPath; Manifest = $manifestPath; ImpactedResources = $impacted.Count; IndexedResources = $index.Count }
     }
     catch {
