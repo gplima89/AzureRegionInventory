@@ -229,6 +229,45 @@ try {
         $serviceProfile = Get-ServiceProfile $storage $index
         $row = ConvertTo-InventoryRow $storage @{ name = 'A'; tenantId = 'tenant' } $serviceProfile 'southeastasia' 'eastasia'
         Assert-True ($row.ImpactScope -eq 'SecondaryRegion' -and $row.SkuName -eq 'Standard_GRS') 'Secondary-region storage is impacted.'
+        Assert-True ($row.AzureService -eq 'Azure Storage (Blob, Files, Queue, Table)' -and $row.ServiceCategory -eq 'Foundational Services (Ring 0)' -and $row.VmSize -eq '') 'Inventory row carries service category columns.'
+        foreach ($case in @(
+            @('Standard_NV4as_v4', 'NVv4-series', 2), @('Standard_D4s_v5', 'Dv5 and DSv5-series', 0), @('standard_d4ds_v5', 'Ddv5 and Ddsv5-series', 0)
+            @('Standard_D4as_v5', 'Dasv5 and Dadsv5-series', 2), @('Standard_B2ms', 'Bs-series', 0), @('Standard_B2s_v2', 'Bsv2-series', 2)
+            @('Standard_DS11-1_v2', 'Dv2 and DSv2-series', 0), @('Standard_E96ias_v4', 'Eav4 and Easv4-series', 2), @('Standard_D8s_v4', 'Dsv4-series', 1)
+            @('Standard_F8s_v2', 'Fsv2-series', 1), @('Standard_M128ms', 'M-series', 1), @('Standard_M416s_8_v2', 'Mv2-series', 2)
+            @('Standard_NC4as_T4_v3', 'NCasT4_v3-series', 2), @('Standard_ND96amsr_A100_v4', 'NDm_A100_v4-Series', 2), @('Standard_ND96asr_v4', 'NDasrA100_v4-Series', 2)
+            @('Standard_L8aos_v4', 'Lsv4, Lasv4, and Laosv4-series', 2), @('Standard_D2_v2_Promo', 'Dv2 and DSv2-series', 0), @('Standard_E64is_v3', 'Ev3 and Esv3-series', 0)
+        )) {
+            $series = Get-VmSeriesClassification $case[0]
+            Assert-True ($series.Listed -and $series.Series -eq $case[1] -and $series.Ring -eq $case[2]) "VM size $($case[0]) maps to $($case[1]) Ring $($case[2])."
+        }
+        $unlisted = Get-VmSeriesClassification 'Standard_D2ls_v6'
+        Assert-True (-not $unlisted.Listed -and $unlisted.Series -eq 'Dlsv6-series' -and $null -eq $unlisted.Ring) 'Unlisted VM series is derived and left unclassified.'
+        $vmCategory = Get-ServiceCategory @{ type = 'Microsoft.Compute/virtualMachines'; properties = @{ hardwareProfile = @{ vmSize = 'Standard_NV4as_v4' } } }
+        Assert-True ($vmCategory.VmSize -eq 'Standard_NV4as_v4' -and $vmCategory.SkuOrVmSeries -eq 'NVv4-series' -and $vmCategory.ServiceCategory -eq 'Strategic Services (Ring 2)') 'VM ring follows its VM series.'
+        $vmCategory = Get-ServiceCategory @{ type = 'microsoft.compute/virtualmachines'; properties = @{} }
+        Assert-True ($vmCategory.ServiceCategory -eq 'Not classified' -and $vmCategory.ServiceCategoryBasis -match 'not exposed') 'VM without a size is explicitly not classified.'
+        $vmssCategory = Get-ServiceCategory @{ type = 'microsoft.compute/virtualmachinescalesets'; sku = @{ name = 'Standard_NV12s_v3' }; properties = @{} }
+        Assert-True ($vmssCategory.ServiceCategory -eq 'Strategic Services (Ring 2)' -and $vmssCategory.ServiceCategoryBasis -match 'most restrictive') 'VMSS uses the most restrictive of service and VM-series rings.'
+        $aksCategory = Get-ServiceCategory @{ type = 'microsoft.containerservice/managedclusters'; properties = @{ agentPoolProfiles = $pools } }
+        Assert-True ($aksCategory.ServiceCategory -eq 'Foundational Services (Ring 0)' -and $aksCategory.VmSize -eq 'Standard_D2s_v5; Standard_D4s_v5') 'AKS exposes distinct node-pool VM sizes and keeps Ring 0 for Ring 0 series.'
+        foreach ($case in @(
+            , @(@{ type = 'microsoft.storage/storageaccounts'; kind = 'BlockBlobStorage'; properties = @{} }, 'Azure Storage: Premium Blob Storage', 'Mainstream Services (Ring 1)')
+            , @(@{ type = 'microsoft.storage/storageaccounts'; kind = 'StorageV2'; properties = @{ isHnsEnabled = $true } }, 'Azure Data Lake Storage Gen2', 'Foundational Services (Ring 0)')
+            , @(@{ type = 'microsoft.compute/disks'; sku = @{ name = 'UltraSSD_LRS' }; properties = @{} }, 'Azure Ultra Disk Storage', 'Strategic Services (Ring 2)')
+            , @(@{ type = 'microsoft.network/virtualnetworkgateways'; properties = @{ gatewayType = 'ExpressRoute' } }, 'Azure ExpressRoute', 'Foundational Services (Ring 0)')
+            , @(@{ type = 'microsoft.web/sites'; kind = 'functionapp,linux'; properties = @{} }, 'Azure Functions', 'Mainstream Services (Ring 1)')
+            , @(@{ type = 'microsoft.web/serverfarms'; sku = @{ tier = 'IsolatedV2' }; properties = @{} }, 'Azure App Service: App Service Environment', 'Mainstream Services (Ring 1)')
+            , @(@{ type = 'microsoft.automation/automationaccounts/runbooks'; properties = @{} }, 'Azure Automation', 'Strategic Services (Ring 2)')
+            , @(@{ type = 'microsoft.network/networkinterfaces'; properties = @{} }, 'Azure Virtual Network', 'Foundational Services (Ring 0)')
+            , @(@{ type = 'microsoft.cognitiveservices/accounts'; kind = 'OpenAI'; properties = @{} }, 'Microsoft Foundry', 'Strategic Services (Ring 2)')
+            , @(@{ type = 'microsoft.cache/redisenterprise'; sku = @{ name = 'Balanced_B5' }; properties = @{} }, 'Azure Managed Redis', 'Mainstream Services (Ring 1)')
+            , @(@{ type = 'microsoft.compute/virtualmachines/extensions'; properties = @{} }, 'Azure Virtual Machines', 'Not classified')
+            , @(@{ type = 'microsoft.cache/redis'; properties = @{} }, '', 'Not classified')
+        )) {
+            $category = Get-ServiceCategory $case[0]
+            Assert-True ($category.AzureService -eq $case[1] -and $category.ServiceCategory -eq $case[2]) "$($case[0].type) classifies as '$($case[1])' / $($case[2])."
+        }
         $cosmos = @{ id = "$prefixA/Microsoft.DocumentDB/databaseAccounts/cosmos"; name = 'cosmos'; type = 'microsoft.documentdb/databaseaccounts'
             resourceGroup = 'workload'; subscriptionId = $subA; location = 'eastasia'
             properties = @{ locations = @(@{ locationName = 'East Asia' }, @{ locationName = 'Southeast Asia' }) } }
@@ -500,6 +539,13 @@ try {
         $inventory = @(Get-JsonLines (Join-Path $out 'Inventory.jsonl'))
         $appRow = @($inventory | Where-Object { $_.ResourceId -eq $appId })[0]
         Assert-True ($appRow.SkuName -eq 'P1v3') 'Late plan resolution updates final app inventory.'
+        $vmRow = @($inventory | Where-Object { $_.ResourceType -eq 'microsoft.compute/virtualmachines' })[0]
+        Assert-True ($vmRow.VmSize -eq 'Standard_D2s_v5' -and $vmRow.SkuOrVmSeries -eq 'Dv5 and DSv5-series' -and $vmRow.ServiceCategory -eq 'Foundational Services (Ring 0)') 'Final inventory carries VM size, series and service category.'
+        $categoryRows = @(Get-JsonLines (Join-Path $out 'ResourceCategory.jsonl'))
+        $vmCategoryRow = @($categoryRows | Where-Object { $_['ResourceType'] -eq 'microsoft.compute/virtualmachines' })
+        Assert-True ($vmCategoryRow.Count -eq 1 -and $vmCategoryRow[0].ResourceCount -eq 1001 -and $vmCategoryRow[0].VmSizes -eq 'Standard_D2s_v5') 'Resource Category aggregates VM type, series and sizes.'
+        Assert-True ($categoryRows[-1].ServiceCategory -eq 'TOTAL' -and $categoryRows[-1].ResourceCount.Cached -eq $inventory.Count) 'Resource Category total matches inventory rows.'
+        Assert-True ($categoryRows[0].ServiceCategory -eq 'Foundational Services (Ring 0)' -and @($categoryRows | Where-Object { $_['ResourceType'] -eq 'microsoft.web/serverfarms' -and $_.ServiceCategory -eq 'Mainstream Services (Ring 1)' }).Count -eq 1) 'Resource Category is ordered by ring and classifies App Service plans.'
         Assert-True ($appRow.SubscriptionId -eq $subA -and $appRow.SubscriptionName -eq 'Workloads') 'Mixed-scope rows use their own subscription metadata, not the query context default subscription.'
         Assert-True (@(Get-JsonLines (Join-Path $out 'ResourceGroups.jsonl')).Count -eq 2) 'Resource-group dataset collected independently of workload region.'
         $slotRow = @($inventory | Where-Object { $_.ResourceType -eq 'microsoft.web/sites/slots' })[0]
@@ -567,7 +613,7 @@ try {
             $reader = [IO.StreamReader]::new($entry.Open())
             try { $wb = [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
             Assert-True ('Inventory_2' -in @($wb.workbook.sheets.sheet.name)) 'Inventory sheets split at requested threshold.'
-            Assert-True (@($wb.workbook.sheets.sheet.name).Count -eq 8 -and 'Dependencies' -notin @($wb.workbook.sheets.sheet.name) -and 'DependencyImpact' -notin @($wb.workbook.sheets.sheet.name)) 'Workbook contains only the seven inventory/report sheets plus the split inventory remainder.'
+            Assert-True (@($wb.workbook.sheets.sheet.name).Count -eq 9 -and 'Resource Category' -in @($wb.workbook.sheets.sheet.name) -and 'Dependencies' -notin @($wb.workbook.sheets.sheet.name) -and 'DependencyImpact' -notin @($wb.workbook.sheets.sheet.name)) 'Workbook contains the eight inventory/report sheets plus the split inventory remainder.'
             $entry = $zip.GetEntry('xl/worksheets/sheet1.xml')
             $reader = [IO.StreamReader]::new($entry.Open())
             try { $summary = [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
@@ -586,6 +632,8 @@ try {
                 Assert-True ($package.Workbook.Worksheets['Summary'].Cells['E7'].Value -eq 1005) 'Independent reader sees cached total.'
                 [OfficeOpenXml.CalculationExtension]::Calculate($package.Workbook)
                 Assert-True ($package.Workbook.Worksheets['Summary'].Cells['E7'].Value -eq 1005) 'Independent engine recalculates formula total.'
+                $categorySheet = $package.Workbook.Worksheets['Resource Category']
+                Assert-True ($categorySheet.Cells[$categorySheet.Dimension.Rows, 6].Value -eq 1005) 'Independent engine recalculates Resource Category total.'
             }
             finally { $package.Dispose() }
         }

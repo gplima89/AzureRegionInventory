@@ -307,7 +307,8 @@ latency, throttling and metadata/export size still affect elapsed time.
 | Worksheet | Contents |
 |---|---|
 | Summary | Snapshot counts by subscription, resource type and impact scope; counts with no tags and no exposed/applicable SKU; formula totals. |
-| Inventory | Impacted resource IDs/names/types, groups, subscriptions and tenants, declared/effective regions, normalized SKU, zones, state, identity metadata, tags, selected service details and migration review prompts. |
+| Inventory | Impacted resource IDs/names/types, groups, subscriptions and tenants, declared/effective regions, normalized SKU, VM size/series, Azure service category (Ring 0/1/2), zones, state, identity metadata, tags, selected service details and migration review prompts. |
+| Resource Category | One row per service category, Azure service, resource type and SKU/VM series (or deciding kind/tier), with observed VM sizes, impacted resource count, classification basis and a formula total. |
 | GlobalContext | Global or unspecified-location resources for a separate review; not automatically counted as impacted. |
 | ResourceGroups | Group metadata location and tags. Group location is not workload deployment location. |
 | ScopeAudit | Final reconciliation per dataset plus any discarded retry attempts, including tenant/explicit IDs, attempt numbers, expected/downloaded counts, page counts, status and failure messages. |
@@ -353,6 +354,35 @@ Configured disk/database sizes are **not used data measurements**. Missing tags
 means no tags at all, not missing specific organizational mandatory tags.
 Tags remain JSON so arbitrary tag names do not create thousands of Excel columns.
 Resource-group tags are not silently treated as inherited resource tags.
+
+### Service category (Ring 0/1/2)
+
+Each Inventory row has `VmSize`, `SkuOrVmSeries`, `AzureService`,
+`ServiceCategory` and `ServiceCategoryBasis`, based on Microsoft's
+[Azure services by category](https://learn.microsoft.com/azure/reliability/availability-service-by-category)
+list: `Foundational Services (Ring 0)`, `Mainstream Services (Ring 1)`,
+`Strategic Services (Ring 2)` or `Not classified`.
+
+- **Resource types** map to listed services in `Get-ServiceCategoryCatalog`.
+  Components (for example NICs/NSGs under Azure Virtual Network) and child types
+  (for example Automation runbooks) are labeled `Inferred` in the basis.
+- **VMs** are classified by VM series derived from `VmSize`
+  (`properties.hardwareProfile.vmSize`), for example `Standard_NV4as_v4` →
+  `NVv4-series` → Ring 2. A series missing from the list is shown, for example
+  `Dlsv6-series`, but is `Not classified`.
+- **VM scale sets and AKS** use the top-level VMSS SKU or the distinct node-pool
+  sizes. Their ring is the most restrictive of the service ring (Ring 0) and any
+  listed VM series ring.
+- **Configuration-dependent types:** storage `kind`/HNS (Premium Blob, Files,
+  ADLS Gen2), Ultra disks, ExpressRoute vs VPN gateways/connections, function,
+  Logic Apps Standard and ASE apps/plans, Foundry Cognitive Services kinds,
+  Foundry hub/project ML workspaces, and Azure Managed Redis SKUs.
+- `Not classified` means the type or series is absent from the list, or the ring
+  depends on a parent resource. Archive tier is per blob and is not evaluated.
+
+Rings describe Microsoft's regional service-availability commitment, not
+workload criticality or target-region readiness. The list changes over time;
+update the catalog and recheck target-region availability before you plan.
 
 ### Regional collection and analysis limits
 
@@ -527,6 +557,7 @@ subscription; compare the scope against the client's authoritative inventory.
 | Export fails with a file-lock, I/O or disk-space error | Open handles, sync software, insufficient space or storage failure | Close applications holding the affected output, check free space and use an approved nonsynchronized folder if sync interference is suspected. Retry to a new path; do not delete unrelated files or previous inventories. |
 | Memory exhaustion or very slow collection | Large regional resource index, large metadata, limited RAM or API throttling | Use 64-bit PowerShell with sufficient RAM and close unnecessary local workloads. Start with representative subscriptions. Batching subscriptions reduces memory but can leave App Service plan SKUs or parent placement unresolved across batches. Lowering worksheet split size does not eliminate the in-memory resource index. |
 | `Summary needs ... data rows; increase RowsPerSheet` | Worksheet split setting is smaller than the summary group count plus its total row | Increase `-RowsPerSheet`, normally back to the default `250000`, without exceeding `1048575`. Rerun to a new output directory. |
+| `Resource Category needs ... data rows; increase RowsPerSheet` | Worksheet split setting is smaller than the category group count plus its total row | Increase `-RowsPerSheet` as above and rerun to a new output directory. |
 | Only an `.xlsx.partial` file exists, or Excel cannot open it | Export was interrupted or failed | Check `Run.json` and the terminal error. The partial ZIP is not a completed workbook; do not rename it to imply success. Preserve JSONL files for investigation and rerun. |
 | Excel displays a repair warning for a final workbook | File corruption, incomplete transfer, or an export defect | Preserve the original file and any repair report. Compare with the original local output, rerun the offline tests and retry the collection to a new folder. Do not assume repaired or missing rows are complete inventory data. |
 | An independent reader reports `Package is an OLE compound document` or asks for a password | The stored workbook may be encrypted or information-protected; confirm with your organization's tooling | Open it in Excel using your authorized account and check its protection/sensitivity status. Libraries without protection support cannot validate an encrypted package. Do not strip protection, rename containers or bypass policy to make a test pass. |
@@ -558,6 +589,15 @@ subscription; compare the scope against the client's authoritative inventory.
   explicit smaller subscription arrays; collection already uses a regional
   resource filter. Document the scope and SKU/parent-lookup boundaries. Do not silently drop
   duplicates or exclude backup resources to label an inventory complete.
+- **`ServiceCategory` is `Not classified`:** read `ServiceCategoryBasis`. The
+  resource type or VM series is not in the supplied list, the VM size was not
+  exposed, or the ring depends on a parent resource. If Microsoft has added the
+  service or series, add it to `Get-ServiceCategoryCatalog` and rerun. Do not
+  assume Ring 0.
+- **Empty `VmSize` for a VM:** ARG did not return
+  `properties.hardwareProfile.vmSize` for that resource. Confirm it in Azure
+  Resource Graph Explorer. A workbook from an older script version has no
+  `VmSize` column.
 - **`Run.json` says `Collecting` after the process has stopped:** the process
   likely terminated before it could record completion. `Failed` records a
   handled failure; `Partial` records collection failures with an exported
